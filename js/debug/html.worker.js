@@ -1,6 +1,10 @@
 (function () {
     'use strict';
 
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
     // Avoid circular dependency on EventEmitter by implementing a subset of the interface.
     class ErrorHandler {
         constructor() {
@@ -8,6 +12,9 @@
             this.unexpectedErrorHandler = function (e) {
                 setTimeout(() => {
                     if (e.stack) {
+                        if (ErrorNoTelemetry.isErrorNoTelemetry(e)) {
+                            throw new ErrorNoTelemetry(e.message + '\n\n' + e.stack);
+                        }
                         throw new Error(e.message + '\n\n' + e.stack);
                     }
                     throw e;
@@ -38,13 +45,14 @@
     }
     function transformErrorForSerialization(error) {
         if (error instanceof Error) {
-            let { name, message } = error;
+            const { name, message } = error;
             const stack = error.stacktrace || error.stack;
             return {
                 $isError: true,
                 name,
                 message,
-                stack
+                stack,
+                noTelemetry: ErrorNoTelemetry.isErrorNoTelemetry(error)
             };
         }
         // return as is
@@ -66,6 +74,42 @@
         constructor() {
             super(canceledName);
             this.name = this.message;
+        }
+    }
+    /**
+     * Error that when thrown won't be logged in telemetry as an unhandled error.
+     */
+    class ErrorNoTelemetry extends Error {
+        constructor(msg) {
+            super(msg);
+            this.name = 'CodeExpectedError';
+        }
+        static fromError(err) {
+            if (err instanceof ErrorNoTelemetry) {
+                return err;
+            }
+            const result = new ErrorNoTelemetry();
+            result.message = err.message;
+            result.stack = err.stack;
+            return result;
+        }
+        static isErrorNoTelemetry(err) {
+            return err.name === 'CodeExpectedError';
+        }
+    }
+    /**
+     * This error indicates a bug.
+     * Do not throw this for invalid user input.
+     * Only catch this error to recover gracefully from bugs.
+     */
+    class BugIndicatingError extends Error {
+        constructor(message) {
+            super(message || 'An unexpected bug occurred.');
+            Object.setPrototypeOf(this, BugIndicatingError.prototype);
+            // Because we know for sure only buggy code throws this,
+            // we definitely want to break here and fix the bug.
+            // eslint-disable-next-line no-debugger
+            // debugger;
         }
     }
 
@@ -106,6 +150,15 @@
             yield element;
         }
         Iterable.single = single;
+        function wrap(iterableOrElement) {
+            if (is(iterableOrElement)) {
+                return iterableOrElement;
+            }
+            else {
+                return single(iterableOrElement);
+            }
+        }
+        Iterable.wrap = wrap;
         function from(iterable) {
             return iterable || _empty;
         }
@@ -159,14 +212,6 @@
             }
         }
         Iterable.concat = concat;
-        function* concatNested(iterables) {
-            for (const iterable of iterables) {
-                for (const element of iterable) {
-                    yield element;
-                }
-            }
-        }
-        Iterable.concatNested = concatNested;
         function reduce(iterable, reducer, initialValue) {
             let value = initialValue;
             for (const element of iterable) {
@@ -213,28 +258,6 @@
             return [consumed, { [Symbol.iterator]() { return iterator; } }];
         }
         Iterable.consume = consume;
-        /**
-         * Returns whether the iterables are the same length and all items are
-         * equal using the comparator function.
-         */
-        function equals(a, b, comparator = (at, bt) => at === bt) {
-            const ai = a[Symbol.iterator]();
-            const bi = b[Symbol.iterator]();
-            while (true) {
-                const an = ai.next();
-                const bn = bi.next();
-                if (an.done !== bn.done) {
-                    return false;
-                }
-                else if (an.done) {
-                    return true;
-                }
-                else if (!comparator(an.value, bn.value)) {
-                    return false;
-                }
-            }
-        }
-        Iterable.equals = equals;
     })(Iterable || (Iterable = {}));
 
     /*---------------------------------------------------------------------------------------------
@@ -246,15 +269,9 @@
     }
     function setParentOfDisposable(child, parent) {
     }
-    class MultiDisposeError extends Error {
-        constructor(errors) {
-            super(`Encountered errors while disposing of store. Errors: [${errors.join(', ')}]`);
-            this.errors = errors;
-        }
-    }
     function dispose(arg) {
         if (Iterable.is(arg)) {
-            let errors = [];
+            const errors = [];
             for (const d of arg) {
                 if (d) {
                     try {
@@ -269,7 +286,7 @@
                 throw errors[0];
             }
             else if (errors.length > 1) {
-                throw new MultiDisposeError(errors);
+                throw new AggregateError(errors, 'Encountered errors while disposing of store');
             }
             return Array.isArray(arg) ? [] : arg;
         }
@@ -278,10 +295,18 @@
             return arg;
         }
     }
+    /**
+     * Combine multiple disposable values into a single {@link IDisposable}.
+     */
     function combinedDisposable(...disposables) {
         const parent = toDisposable(() => dispose(disposables));
         return parent;
     }
+    /**
+     * Turn a function that implements dispose into an {@link IDisposable}.
+     *
+     * @param fn Clean up function, guaranteed to be called only **once**.
+     */
     function toDisposable(fn) {
         const self = trackDisposable({
             dispose: once(() => {
@@ -290,6 +315,13 @@
         });
         return self;
     }
+    /**
+     * Manages a collection of disposable values.
+     *
+     * This is the preferred way to manage multiple disposables. A `DisposableStore` is safer to work with than an
+     * `IDisposable[]` as it considers edge cases, such as registering the same value multiple times or adding an item to a
+     * store that has already been disposed of.
+     */
     class DisposableStore {
         constructor() {
             this._toDispose = new Set();
@@ -308,7 +340,7 @@
             this.clear();
         }
         /**
-         * Returns `true` if this object has been disposed
+         * @return `true` if this object has been disposed of.
          */
         get isDisposed() {
             return this._isDisposed;
@@ -317,13 +349,19 @@
          * Dispose of all registered disposables but do not mark this object as disposed.
          */
         clear() {
+            if (this._toDispose.size === 0) {
+                return;
+            }
             try {
-                dispose(this._toDispose.values());
+                dispose(this._toDispose);
             }
             finally {
                 this._toDispose.clear();
             }
         }
+        /**
+         * Add a new {@link IDisposable disposable} to the collection.
+         */
         add(o) {
             if (!o) {
                 return o;
@@ -343,6 +381,11 @@
         }
     }
     DisposableStore.DISABLE_DISPOSED_WARNING = false;
+    /**
+     * Abstract base class for a {@link IDisposable disposable} object.
+     *
+     * Subclasses can {@linkcode _register} disposables that will be automatically cleaned up when this object is disposed of.
+     */
     class Disposable {
         constructor() {
             this._store = new DisposableStore();
@@ -351,6 +394,9 @@
         dispose() {
             this._store.dispose();
         }
+        /**
+         * Adds `o` to the collection of disposables managed by this object.
+         */
         _register(o) {
             if (o === this) {
                 throw new Error('Cannot register a disposable on itself!');
@@ -358,6 +404,11 @@
             return this._store.add(o);
         }
     }
+    /**
+     * A disposable that does nothing when it is disposed of.
+     *
+     * TODO: This should not be a static property.
+     */
     Disposable.None = Object.freeze({ dispose() { } });
 
     /*---------------------------------------------------------------------------------------------
@@ -489,15 +540,969 @@
      *  Copyright (c) Microsoft Corporation. All rights reserved.
      *  Licensed under the MIT License. See License.txt in the project root for license information.
      *--------------------------------------------------------------------------------------------*/
+    const hasPerformanceNow = (globalThis.performance && typeof globalThis.performance.now === 'function');
+    class StopWatch {
+        static create(highResolution) {
+            return new StopWatch(highResolution);
+        }
+        constructor(highResolution) {
+            this._now = hasPerformanceNow && highResolution === false ? Date.now : globalThis.performance.now.bind(globalThis.performance);
+            this._startTime = this._now();
+            this._stopTime = -1;
+        }
+        stop() {
+            this._stopTime = this._now();
+        }
+        elapsed() {
+            if (this._stopTime !== -1) {
+                return this._stopTime - this._startTime;
+            }
+            return this._now() - this._startTime;
+        }
+    }
+
+    var Event;
+    (function (Event) {
+        Event.None = () => Disposable.None;
+        /**
+         * Given an event, returns another event which debounces calls and defers the listeners to a later task via a shared
+         * `setTimeout`. The event is converted into a signal (`Event<void>`) to avoid additional object creation as a
+         * result of merging events and to try prevent race conditions that could arise when using related deferred and
+         * non-deferred events.
+         *
+         * This is useful for deferring non-critical work (eg. general UI updates) to ensure it does not block critical work
+         * (eg. latency of keypress to text rendered).
+         *
+         * *NOTE* that this function returns an `Event` and it MUST be called with a `DisposableStore` whenever the returned
+         * event is accessible to "third parties", e.g the event is a public property. Otherwise a leaked listener on the
+         * returned event causes this utility to leak a listener on the original event.
+         *
+         * @param event The event source for the new event.
+         * @param disposable A disposable store to add the new EventEmitter to.
+         */
+        function defer(event, disposable) {
+            return debounce(event, () => void 0, 0, undefined, true, undefined, disposable);
+        }
+        Event.defer = defer;
+        /**
+         * Given an event, returns another event which only fires once.
+         *
+         * @param event The event source for the new event.
+         */
+        function once(event) {
+            return (listener, thisArgs = null, disposables) => {
+                // we need this, in case the event fires during the listener call
+                let didFire = false;
+                let result = undefined;
+                result = event(e => {
+                    if (didFire) {
+                        return;
+                    }
+                    else if (result) {
+                        result.dispose();
+                    }
+                    else {
+                        didFire = true;
+                    }
+                    return listener.call(thisArgs, e);
+                }, null, disposables);
+                if (didFire) {
+                    result.dispose();
+                }
+                return result;
+            };
+        }
+        Event.once = once;
+        /**
+         * Maps an event of one type into an event of another type using a mapping function, similar to how
+         * `Array.prototype.map` works.
+         *
+         * *NOTE* that this function returns an `Event` and it MUST be called with a `DisposableStore` whenever the returned
+         * event is accessible to "third parties", e.g the event is a public property. Otherwise a leaked listener on the
+         * returned event causes this utility to leak a listener on the original event.
+         *
+         * @param event The event source for the new event.
+         * @param map The mapping function.
+         * @param disposable A disposable store to add the new EventEmitter to.
+         */
+        function map(event, map, disposable) {
+            return snapshot((listener, thisArgs = null, disposables) => event(i => listener.call(thisArgs, map(i)), null, disposables), disposable);
+        }
+        Event.map = map;
+        /**
+         * Wraps an event in another event that performs some function on the event object before firing.
+         *
+         * *NOTE* that this function returns an `Event` and it MUST be called with a `DisposableStore` whenever the returned
+         * event is accessible to "third parties", e.g the event is a public property. Otherwise a leaked listener on the
+         * returned event causes this utility to leak a listener on the original event.
+         *
+         * @param event The event source for the new event.
+         * @param each The function to perform on the event object.
+         * @param disposable A disposable store to add the new EventEmitter to.
+         */
+        function forEach(event, each, disposable) {
+            return snapshot((listener, thisArgs = null, disposables) => event(i => { each(i); listener.call(thisArgs, i); }, null, disposables), disposable);
+        }
+        Event.forEach = forEach;
+        function filter(event, filter, disposable) {
+            return snapshot((listener, thisArgs = null, disposables) => event(e => filter(e) && listener.call(thisArgs, e), null, disposables), disposable);
+        }
+        Event.filter = filter;
+        /**
+         * Given an event, returns the same event but typed as `Event<void>`.
+         */
+        function signal(event) {
+            return event;
+        }
+        Event.signal = signal;
+        function any(...events) {
+            return (listener, thisArgs = null, disposables) => combinedDisposable(...events.map(event => event(e => listener.call(thisArgs, e), null, disposables)));
+        }
+        Event.any = any;
+        /**
+         * *NOTE* that this function returns an `Event` and it MUST be called with a `DisposableStore` whenever the returned
+         * event is accessible to "third parties", e.g the event is a public property. Otherwise a leaked listener on the
+         * returned event causes this utility to leak a listener on the original event.
+         */
+        function reduce(event, merge, initial, disposable) {
+            let output = initial;
+            return map(event, e => {
+                output = merge(output, e);
+                return output;
+            }, disposable);
+        }
+        Event.reduce = reduce;
+        function snapshot(event, disposable) {
+            let listener;
+            const options = {
+                onWillAddFirstListener() {
+                    listener = event(emitter.fire, emitter);
+                },
+                onDidRemoveLastListener() {
+                    listener === null || listener === void 0 ? void 0 : listener.dispose();
+                }
+            };
+            const emitter = new Emitter(options);
+            disposable === null || disposable === void 0 ? void 0 : disposable.add(emitter);
+            return emitter.event;
+        }
+        function debounce(event, merge, delay = 100, leading = false, flushOnListenerRemove = false, leakWarningThreshold, disposable) {
+            let subscription;
+            let output = undefined;
+            let handle = undefined;
+            let numDebouncedCalls = 0;
+            let doFire;
+            const options = {
+                leakWarningThreshold,
+                onWillAddFirstListener() {
+                    subscription = event(cur => {
+                        numDebouncedCalls++;
+                        output = merge(output, cur);
+                        if (leading && !handle) {
+                            emitter.fire(output);
+                            output = undefined;
+                        }
+                        doFire = () => {
+                            const _output = output;
+                            output = undefined;
+                            handle = undefined;
+                            if (!leading || numDebouncedCalls > 1) {
+                                emitter.fire(_output);
+                            }
+                            numDebouncedCalls = 0;
+                        };
+                        if (typeof delay === 'number') {
+                            clearTimeout(handle);
+                            handle = setTimeout(doFire, delay);
+                        }
+                        else {
+                            if (handle === undefined) {
+                                handle = 0;
+                                queueMicrotask(doFire);
+                            }
+                        }
+                    });
+                },
+                onWillRemoveListener() {
+                    if (flushOnListenerRemove && numDebouncedCalls > 0) {
+                        doFire === null || doFire === void 0 ? void 0 : doFire();
+                    }
+                },
+                onDidRemoveLastListener() {
+                    doFire = undefined;
+                    subscription.dispose();
+                }
+            };
+            const emitter = new Emitter(options);
+            disposable === null || disposable === void 0 ? void 0 : disposable.add(emitter);
+            return emitter.event;
+        }
+        Event.debounce = debounce;
+        /**
+         * Debounces an event, firing after some delay (default=0) with an array of all event original objects.
+         *
+         * *NOTE* that this function returns an `Event` and it MUST be called with a `DisposableStore` whenever the returned
+         * event is accessible to "third parties", e.g the event is a public property. Otherwise a leaked listener on the
+         * returned event causes this utility to leak a listener on the original event.
+         */
+        function accumulate(event, delay = 0, disposable) {
+            return Event.debounce(event, (last, e) => {
+                if (!last) {
+                    return [e];
+                }
+                last.push(e);
+                return last;
+            }, delay, undefined, true, undefined, disposable);
+        }
+        Event.accumulate = accumulate;
+        /**
+         * Filters an event such that some condition is _not_ met more than once in a row, effectively ensuring duplicate
+         * event objects from different sources do not fire the same event object.
+         *
+         * *NOTE* that this function returns an `Event` and it MUST be called with a `DisposableStore` whenever the returned
+         * event is accessible to "third parties", e.g the event is a public property. Otherwise a leaked listener on the
+         * returned event causes this utility to leak a listener on the original event.
+         *
+         * @param event The event source for the new event.
+         * @param equals The equality condition.
+         * @param disposable A disposable store to add the new EventEmitter to.
+         *
+         * @example
+         * ```
+         * // Fire only one time when a single window is opened or focused
+         * Event.latch(Event.any(onDidOpenWindow, onDidFocusWindow))
+         * ```
+         */
+        function latch(event, equals = (a, b) => a === b, disposable) {
+            let firstCall = true;
+            let cache;
+            return filter(event, value => {
+                const shouldEmit = firstCall || !equals(value, cache);
+                firstCall = false;
+                cache = value;
+                return shouldEmit;
+            }, disposable);
+        }
+        Event.latch = latch;
+        /**
+         * Splits an event whose parameter is a union type into 2 separate events for each type in the union.
+         *
+         * *NOTE* that this function returns an `Event` and it MUST be called with a `DisposableStore` whenever the returned
+         * event is accessible to "third parties", e.g the event is a public property. Otherwise a leaked listener on the
+         * returned event causes this utility to leak a listener on the original event.
+         *
+         * @example
+         * ```
+         * const event = new EventEmitter<number | undefined>().event;
+         * const [numberEvent, undefinedEvent] = Event.split(event, isUndefined);
+         * ```
+         *
+         * @param event The event source for the new event.
+         * @param isT A function that determines what event is of the first type.
+         * @param disposable A disposable store to add the new EventEmitter to.
+         */
+        function split(event, isT, disposable) {
+            return [
+                Event.filter(event, isT, disposable),
+                Event.filter(event, e => !isT(e), disposable),
+            ];
+        }
+        Event.split = split;
+        /**
+         * Buffers an event until it has a listener attached.
+         *
+         * *NOTE* that this function returns an `Event` and it MUST be called with a `DisposableStore` whenever the returned
+         * event is accessible to "third parties", e.g the event is a public property. Otherwise a leaked listener on the
+         * returned event causes this utility to leak a listener on the original event.
+         *
+         * @param event The event source for the new event.
+         * @param flushAfterTimeout Determines whether to flush the buffer after a timeout immediately or after a
+         * `setTimeout` when the first event listener is added.
+         * @param _buffer Internal: A source event array used for tests.
+         *
+         * @example
+         * ```
+         * // Start accumulating events, when the first listener is attached, flush
+         * // the event after a timeout such that multiple listeners attached before
+         * // the timeout would receive the event
+         * this.onInstallExtension = Event.buffer(service.onInstallExtension, true);
+         * ```
+         */
+        function buffer(event, flushAfterTimeout = false, _buffer = []) {
+            let buffer = _buffer.slice();
+            let listener = event(e => {
+                if (buffer) {
+                    buffer.push(e);
+                }
+                else {
+                    emitter.fire(e);
+                }
+            });
+            const flush = () => {
+                buffer === null || buffer === void 0 ? void 0 : buffer.forEach(e => emitter.fire(e));
+                buffer = null;
+            };
+            const emitter = new Emitter({
+                onWillAddFirstListener() {
+                    if (!listener) {
+                        listener = event(e => emitter.fire(e));
+                    }
+                },
+                onDidAddFirstListener() {
+                    if (buffer) {
+                        if (flushAfterTimeout) {
+                            setTimeout(flush);
+                        }
+                        else {
+                            flush();
+                        }
+                    }
+                },
+                onDidRemoveLastListener() {
+                    if (listener) {
+                        listener.dispose();
+                    }
+                    listener = null;
+                }
+            });
+            return emitter.event;
+        }
+        Event.buffer = buffer;
+        class ChainableEvent {
+            constructor(event) {
+                this.event = event;
+                this.disposables = new DisposableStore();
+            }
+            /** @see {@link Event.map} */
+            map(fn) {
+                return new ChainableEvent(map(this.event, fn, this.disposables));
+            }
+            /** @see {@link Event.forEach} */
+            forEach(fn) {
+                return new ChainableEvent(forEach(this.event, fn, this.disposables));
+            }
+            filter(fn) {
+                return new ChainableEvent(filter(this.event, fn, this.disposables));
+            }
+            /** @see {@link Event.reduce} */
+            reduce(merge, initial) {
+                return new ChainableEvent(reduce(this.event, merge, initial, this.disposables));
+            }
+            /** @see {@link Event.reduce} */
+            latch() {
+                return new ChainableEvent(latch(this.event, undefined, this.disposables));
+            }
+            debounce(merge, delay = 100, leading = false, flushOnListenerRemove = false, leakWarningThreshold) {
+                return new ChainableEvent(debounce(this.event, merge, delay, leading, flushOnListenerRemove, leakWarningThreshold, this.disposables));
+            }
+            /**
+             * Attach a listener to the event.
+             */
+            on(listener, thisArgs, disposables) {
+                return this.event(listener, thisArgs, disposables);
+            }
+            /** @see {@link Event.once} */
+            once(listener, thisArgs, disposables) {
+                return once(this.event)(listener, thisArgs, disposables);
+            }
+            dispose() {
+                this.disposables.dispose();
+            }
+        }
+        /**
+         * Wraps the event in an {@link IChainableEvent}, allowing a more functional programming style.
+         *
+         * @example
+         * ```
+         * // Normal
+         * const onEnterPressNormal = Event.filter(
+         *   Event.map(onKeyPress.event, e => new StandardKeyboardEvent(e)),
+         *   e.keyCode === KeyCode.Enter
+         * ).event;
+         *
+         * // Using chain
+         * const onEnterPressChain = Event.chain(onKeyPress.event)
+         *   .map(e => new StandardKeyboardEvent(e))
+         *   .filter(e => e.keyCode === KeyCode.Enter)
+         *   .event;
+         * ```
+         */
+        function chain(event) {
+            return new ChainableEvent(event);
+        }
+        Event.chain = chain;
+        /**
+         * Creates an {@link Event} from a node event emitter.
+         */
+        function fromNodeEventEmitter(emitter, eventName, map = id => id) {
+            const fn = (...args) => result.fire(map(...args));
+            const onFirstListenerAdd = () => emitter.on(eventName, fn);
+            const onLastListenerRemove = () => emitter.removeListener(eventName, fn);
+            const result = new Emitter({ onWillAddFirstListener: onFirstListenerAdd, onDidRemoveLastListener: onLastListenerRemove });
+            return result.event;
+        }
+        Event.fromNodeEventEmitter = fromNodeEventEmitter;
+        /**
+         * Creates an {@link Event} from a DOM event emitter.
+         */
+        function fromDOMEventEmitter(emitter, eventName, map = id => id) {
+            const fn = (...args) => result.fire(map(...args));
+            const onFirstListenerAdd = () => emitter.addEventListener(eventName, fn);
+            const onLastListenerRemove = () => emitter.removeEventListener(eventName, fn);
+            const result = new Emitter({ onWillAddFirstListener: onFirstListenerAdd, onDidRemoveLastListener: onLastListenerRemove });
+            return result.event;
+        }
+        Event.fromDOMEventEmitter = fromDOMEventEmitter;
+        /**
+         * Creates a promise out of an event, using the {@link Event.once} helper.
+         */
+        function toPromise(event) {
+            return new Promise(resolve => once(event)(resolve));
+        }
+        Event.toPromise = toPromise;
+        /**
+         * Adds a listener to an event and calls the listener immediately with undefined as the event object.
+         *
+         * @example
+         * ```
+         * // Initialize the UI and update it when dataChangeEvent fires
+         * runAndSubscribe(dataChangeEvent, () => this._updateUI());
+         * ```
+         */
+        function runAndSubscribe(event, handler) {
+            handler(undefined);
+            return event(e => handler(e));
+        }
+        Event.runAndSubscribe = runAndSubscribe;
+        /**
+         * Adds a listener to an event and calls the listener immediately with undefined as the event object. A new
+         * {@link DisposableStore} is passed to the listener which is disposed when the returned disposable is disposed.
+         */
+        function runAndSubscribeWithStore(event, handler) {
+            let store = null;
+            function run(e) {
+                store === null || store === void 0 ? void 0 : store.dispose();
+                store = new DisposableStore();
+                handler(e, store);
+            }
+            run(undefined);
+            const disposable = event(e => run(e));
+            return toDisposable(() => {
+                disposable.dispose();
+                store === null || store === void 0 ? void 0 : store.dispose();
+            });
+        }
+        Event.runAndSubscribeWithStore = runAndSubscribeWithStore;
+        class EmitterObserver {
+            constructor(_observable, store) {
+                this._observable = _observable;
+                this._counter = 0;
+                this._hasChanged = false;
+                const options = {
+                    onWillAddFirstListener: () => {
+                        _observable.addObserver(this);
+                    },
+                    onDidRemoveLastListener: () => {
+                        _observable.removeObserver(this);
+                    }
+                };
+                this.emitter = new Emitter(options);
+                if (store) {
+                    store.add(this.emitter);
+                }
+            }
+            beginUpdate(_observable) {
+                // assert(_observable === this.obs);
+                this._counter++;
+            }
+            handlePossibleChange(_observable) {
+                // assert(_observable === this.obs);
+            }
+            handleChange(_observable, _change) {
+                // assert(_observable === this.obs);
+                this._hasChanged = true;
+            }
+            endUpdate(_observable) {
+                // assert(_observable === this.obs);
+                this._counter--;
+                if (this._counter === 0) {
+                    this._observable.reportChanges();
+                    if (this._hasChanged) {
+                        this._hasChanged = false;
+                        this.emitter.fire(this._observable.get());
+                    }
+                }
+            }
+        }
+        /**
+         * Creates an event emitter that is fired when the observable changes.
+         * Each listeners subscribes to the emitter.
+         */
+        function fromObservable(obs, store) {
+            const observer = new EmitterObserver(obs, store);
+            return observer.emitter.event;
+        }
+        Event.fromObservable = fromObservable;
+        /**
+         * Each listener is attached to the observable directly.
+         */
+        function fromObservableLight(observable) {
+            return (listener) => {
+                let count = 0;
+                let didChange = false;
+                const observer = {
+                    beginUpdate() {
+                        count++;
+                    },
+                    endUpdate() {
+                        count--;
+                        if (count === 0) {
+                            observable.reportChanges();
+                            if (didChange) {
+                                didChange = false;
+                                listener();
+                            }
+                        }
+                    },
+                    handlePossibleChange() {
+                        // noop
+                    },
+                    handleChange() {
+                        didChange = true;
+                    }
+                };
+                observable.addObserver(observer);
+                observable.reportChanges();
+                return {
+                    dispose() {
+                        observable.removeObserver(observer);
+                    }
+                };
+            };
+        }
+        Event.fromObservableLight = fromObservableLight;
+    })(Event || (Event = {}));
+    class EventProfiling {
+        constructor(name) {
+            this.listenerCount = 0;
+            this.invocationCount = 0;
+            this.elapsedOverall = 0;
+            this.durations = [];
+            this.name = `${name}_${EventProfiling._idPool++}`;
+            EventProfiling.all.add(this);
+        }
+        start(listenerCount) {
+            this._stopWatch = new StopWatch();
+            this.listenerCount = listenerCount;
+        }
+        stop() {
+            if (this._stopWatch) {
+                const elapsed = this._stopWatch.elapsed();
+                this.durations.push(elapsed);
+                this.elapsedOverall += elapsed;
+                this.invocationCount += 1;
+                this._stopWatch = undefined;
+            }
+        }
+    }
+    EventProfiling.all = new Set();
+    EventProfiling._idPool = 0;
+    let _globalLeakWarningThreshold = -1;
+    class LeakageMonitor {
+        constructor(threshold, name = Math.random().toString(18).slice(2, 5)) {
+            this.threshold = threshold;
+            this.name = name;
+            this._warnCountdown = 0;
+        }
+        dispose() {
+            var _a;
+            (_a = this._stacks) === null || _a === void 0 ? void 0 : _a.clear();
+        }
+        check(stack, listenerCount) {
+            const threshold = this.threshold;
+            if (threshold <= 0 || listenerCount < threshold) {
+                return undefined;
+            }
+            if (!this._stacks) {
+                this._stacks = new Map();
+            }
+            const count = (this._stacks.get(stack.value) || 0);
+            this._stacks.set(stack.value, count + 1);
+            this._warnCountdown -= 1;
+            if (this._warnCountdown <= 0) {
+                // only warn on first exceed and then every time the limit
+                // is exceeded by 50% again
+                this._warnCountdown = threshold * 0.5;
+                // find most frequent listener and print warning
+                let topStack;
+                let topCount = 0;
+                for (const [stack, count] of this._stacks) {
+                    if (!topStack || topCount < count) {
+                        topStack = stack;
+                        topCount = count;
+                    }
+                }
+                console.warn(`[${this.name}] potential listener LEAK detected, having ${listenerCount} listeners already. MOST frequent listener (${topCount}):`);
+                console.warn(topStack);
+            }
+            return () => {
+                const count = (this._stacks.get(stack.value) || 0);
+                this._stacks.set(stack.value, count - 1);
+            };
+        }
+    }
+    class Stacktrace {
+        static create() {
+            var _a;
+            return new Stacktrace((_a = new Error().stack) !== null && _a !== void 0 ? _a : '');
+        }
+        constructor(value) {
+            this.value = value;
+        }
+        print() {
+            console.warn(this.value.split('\n').slice(2).join('\n'));
+        }
+    }
+    class UniqueContainer {
+        constructor(value) {
+            this.value = value;
+        }
+    }
+    const compactionThreshold = 2;
+    /**
+     * The Emitter can be used to expose an Event to the public
+     * to fire it from the insides.
+     * Sample:
+        class Document {
+
+            private readonly _onDidChange = new Emitter<(value:string)=>any>();
+
+            public onDidChange = this._onDidChange.event;
+
+            // getter-style
+            // get onDidChange(): Event<(value:string)=>any> {
+            // 	return this._onDidChange.event;
+            // }
+
+            private _doIt() {
+                //...
+                this._onDidChange.fire(value);
+            }
+        }
+     */
+    class Emitter {
+        constructor(options) {
+            var _a, _b, _c, _d, _e;
+            this._size = 0;
+            this._options = options;
+            this._leakageMon = ((_a = this._options) === null || _a === void 0 ? void 0 : _a.leakWarningThreshold) ? new LeakageMonitor((_c = (_b = this._options) === null || _b === void 0 ? void 0 : _b.leakWarningThreshold) !== null && _c !== void 0 ? _c : _globalLeakWarningThreshold) : undefined;
+            this._perfMon = ((_d = this._options) === null || _d === void 0 ? void 0 : _d._profName) ? new EventProfiling(this._options._profName) : undefined;
+            this._deliveryQueue = (_e = this._options) === null || _e === void 0 ? void 0 : _e.deliveryQueue;
+        }
+        dispose() {
+            var _a, _b, _c, _d;
+            if (!this._disposed) {
+                this._disposed = true;
+                // It is bad to have listeners at the time of disposing an emitter, it is worst to have listeners keep the emitter
+                // alive via the reference that's embedded in their disposables. Therefore we loop over all remaining listeners and
+                // unset their subscriptions/disposables. Looping and blaming remaining listeners is done on next tick because the
+                // the following programming pattern is very popular:
+                //
+                // const someModel = this._disposables.add(new ModelObject()); // (1) create and register model
+                // this._disposables.add(someModel.onDidChange(() => { ... }); // (2) subscribe and register model-event listener
+                // ...later...
+                // this._disposables.dispose(); disposes (1) then (2): don't warn after (1) but after the "overall dispose" is done
+                if (((_a = this._deliveryQueue) === null || _a === void 0 ? void 0 : _a.current) === this) {
+                    this._deliveryQueue.reset();
+                }
+                if (this._listeners) {
+                    this._listeners = undefined;
+                    this._size = 0;
+                }
+                (_c = (_b = this._options) === null || _b === void 0 ? void 0 : _b.onDidRemoveLastListener) === null || _c === void 0 ? void 0 : _c.call(_b);
+                (_d = this._leakageMon) === null || _d === void 0 ? void 0 : _d.dispose();
+            }
+        }
+        /**
+         * For the public to allow to subscribe
+         * to events from this Emitter
+         */
+        get event() {
+            var _a;
+            (_a = this._event) !== null && _a !== void 0 ? _a : (this._event = (callback, thisArgs, disposables) => {
+                var _a, _b, _c, _d, _e;
+                if (this._leakageMon && this._size > this._leakageMon.threshold * 3) {
+                    console.warn(`[${this._leakageMon.name}] REFUSES to accept new listeners because it exceeded its threshold by far`);
+                    return Disposable.None;
+                }
+                if (this._disposed) {
+                    // todo: should we warn if a listener is added to a disposed emitter? This happens often
+                    return Disposable.None;
+                }
+                if (thisArgs) {
+                    callback = callback.bind(thisArgs);
+                }
+                const contained = new UniqueContainer(callback);
+                let removeMonitor;
+                if (this._leakageMon && this._size >= Math.ceil(this._leakageMon.threshold * 0.2)) {
+                    // check and record this emitter for potential leakage
+                    contained.stack = Stacktrace.create();
+                    removeMonitor = this._leakageMon.check(contained.stack, this._size + 1);
+                }
+                if (!this._listeners) {
+                    (_b = (_a = this._options) === null || _a === void 0 ? void 0 : _a.onWillAddFirstListener) === null || _b === void 0 ? void 0 : _b.call(_a, this);
+                    this._listeners = contained;
+                    (_d = (_c = this._options) === null || _c === void 0 ? void 0 : _c.onDidAddFirstListener) === null || _d === void 0 ? void 0 : _d.call(_c, this);
+                }
+                else if (this._listeners instanceof UniqueContainer) {
+                    (_e = this._deliveryQueue) !== null && _e !== void 0 ? _e : (this._deliveryQueue = new EventDeliveryQueuePrivate());
+                    this._listeners = [this._listeners, contained];
+                }
+                else {
+                    this._listeners.push(contained);
+                }
+                this._size++;
+                const result = toDisposable(() => { removeMonitor === null || removeMonitor === void 0 ? void 0 : removeMonitor(); this._removeListener(contained); });
+                if (disposables instanceof DisposableStore) {
+                    disposables.add(result);
+                }
+                else if (Array.isArray(disposables)) {
+                    disposables.push(result);
+                }
+                return result;
+            });
+            return this._event;
+        }
+        _removeListener(listener) {
+            var _a, _b, _c, _d;
+            (_b = (_a = this._options) === null || _a === void 0 ? void 0 : _a.onWillRemoveListener) === null || _b === void 0 ? void 0 : _b.call(_a, this);
+            if (!this._listeners) {
+                return; // expected if a listener gets disposed
+            }
+            if (this._size === 1) {
+                this._listeners = undefined;
+                (_d = (_c = this._options) === null || _c === void 0 ? void 0 : _c.onDidRemoveLastListener) === null || _d === void 0 ? void 0 : _d.call(_c, this);
+                this._size = 0;
+                return;
+            }
+            // size > 1 which requires that listeners be a list:
+            const listeners = this._listeners;
+            const index = listeners.indexOf(listener);
+            if (index === -1) {
+                console.log('disposed?', this._disposed);
+                console.log('size?', this._size);
+                console.log('arr?', JSON.stringify(this._listeners));
+                throw new Error('Attempted to dispose unknown listener');
+            }
+            this._size--;
+            listeners[index] = undefined;
+            const adjustDeliveryQueue = this._deliveryQueue.current === this;
+            if (this._size * compactionThreshold <= listeners.length) {
+                let n = 0;
+                for (let i = 0; i < listeners.length; i++) {
+                    if (listeners[i]) {
+                        listeners[n++] = listeners[i];
+                    }
+                    else if (adjustDeliveryQueue) {
+                        this._deliveryQueue.end--;
+                        if (n < this._deliveryQueue.i) {
+                            this._deliveryQueue.i--;
+                        }
+                    }
+                }
+                listeners.length = n;
+            }
+        }
+        _deliver(listener, value) {
+            var _a;
+            if (!listener) {
+                return;
+            }
+            const errorHandler = ((_a = this._options) === null || _a === void 0 ? void 0 : _a.onListenerError) || onUnexpectedError;
+            if (!errorHandler) {
+                listener.value(value);
+                return;
+            }
+            try {
+                listener.value(value);
+            }
+            catch (e) {
+                errorHandler(e);
+            }
+        }
+        /** Delivers items in the queue. Assumes the queue is ready to go. */
+        _deliverQueue(dq) {
+            const listeners = dq.current._listeners;
+            while (dq.i < dq.end) {
+                // important: dq.i is incremented before calling deliver() because it might reenter deliverQueue()
+                this._deliver(listeners[dq.i++], dq.value);
+            }
+            dq.reset();
+        }
+        /**
+         * To be kept private to fire an event to
+         * subscribers
+         */
+        fire(event) {
+            var _a, _b, _c, _d;
+            if ((_a = this._deliveryQueue) === null || _a === void 0 ? void 0 : _a.current) {
+                this._deliverQueue(this._deliveryQueue);
+                (_b = this._perfMon) === null || _b === void 0 ? void 0 : _b.stop(); // last fire() will have starting perfmon, stop it before starting the next dispatch
+            }
+            (_c = this._perfMon) === null || _c === void 0 ? void 0 : _c.start(this._size);
+            if (!this._listeners) ;
+            else if (this._listeners instanceof UniqueContainer) {
+                this._deliver(this._listeners, event);
+            }
+            else {
+                const dq = this._deliveryQueue;
+                dq.enqueue(this, event, this._listeners.length);
+                this._deliverQueue(dq);
+            }
+            (_d = this._perfMon) === null || _d === void 0 ? void 0 : _d.stop();
+        }
+        hasListeners() {
+            return this._size > 0;
+        }
+    }
+    class EventDeliveryQueuePrivate {
+        constructor() {
+            /**
+             * Index in current's listener list.
+             */
+            this.i = -1;
+            /**
+             * The last index in the listener's list to deliver.
+             */
+            this.end = 0;
+        }
+        enqueue(emitter, value, end) {
+            this.i = 0;
+            this.end = end;
+            this.current = emitter;
+            this.value = value;
+        }
+        reset() {
+            this.i = this.end; // force any current emission loop to stop, mainly for during dispose
+            this.current = undefined;
+            this.value = undefined;
+        }
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    /**
+     * @returns whether the provided parameter is a JavaScript String or not.
+     */
+    function isString(str) {
+        return (typeof str === 'string');
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    function getAllPropertyNames(obj) {
+        let res = [];
+        while (Object.prototype !== obj) {
+            res = res.concat(Object.getOwnPropertyNames(obj));
+            obj = Object.getPrototypeOf(obj);
+        }
+        return res;
+    }
+    function getAllMethodNames(obj) {
+        const methods = [];
+        for (const prop of getAllPropertyNames(obj)) {
+            if (typeof obj[prop] === 'function') {
+                methods.push(prop);
+            }
+        }
+        return methods;
+    }
+    function createProxyObject$1(methodNames, invoke) {
+        const createProxyMethod = (method) => {
+            return function () {
+                const args = Array.prototype.slice.call(arguments, 0);
+                return invoke(method, args);
+            };
+        };
+        const result = {};
+        for (const methodName of methodNames) {
+            result[methodName] = createProxyMethod(methodName);
+        }
+        return result;
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    (undefined && undefined.__awaiter) || function (thisArg, _arguments, P, generator) {
+        function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+        return new (P || (P = Promise))(function (resolve, reject) {
+            function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+            function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+            function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+            step((generator = generator.apply(thisArg, _arguments || [])).next());
+        });
+    };
+    let isPseudo = (typeof document !== 'undefined' && document.location && document.location.hash.indexOf('pseudo=true') >= 0);
+    function _format$1(message, args) {
+        let result;
+        if (args.length === 0) {
+            result = message;
+        }
+        else {
+            result = message.replace(/\{(\d+)\}/g, (match, rest) => {
+                const index = rest[0];
+                const arg = args[index];
+                let result = match;
+                if (typeof arg === 'string') {
+                    result = arg;
+                }
+                else if (typeof arg === 'number' || typeof arg === 'boolean' || arg === void 0 || arg === null) {
+                    result = String(arg);
+                }
+                return result;
+            });
+        }
+        if (isPseudo) {
+            // FF3B and FF3D is the Unicode zenkaku representation for [ and ]
+            result = '\uFF3B' + result.replace(/[aouei]/g, '$&$&') + '\uFF3D';
+        }
+        return result;
+    }
+    /**
+     * @skipMangle
+     */
+    function localize$1(data, message, ...args) {
+        return _format$1(message, args);
+    }
+    /**
+     * @skipMangle
+     */
+    function getConfiguredDefaultLocale(_) {
+        // This returns undefined because this implementation isn't used and is overwritten by the loader
+        // when loaded.
+        return undefined;
+    }
+
     var _a$2;
     const LANGUAGE_DEFAULT = 'en';
     let _isWindows = false;
     let _isMacintosh = false;
     let _isLinux = false;
+    let _isWeb = false;
     let _locale = undefined;
     let _language = LANGUAGE_DEFAULT;
+    let _platformLocale = LANGUAGE_DEFAULT;
     let _translationsConfigFile = undefined;
     let _userAgent = undefined;
+    /**
+     * @deprecated use `globalThis` instead
+     */
     const globals = (typeof self === 'object' ? self : typeof global === 'object' ? global : {});
     let nodeProcess = undefined;
     if (typeof globals.vscode !== 'undefined' && typeof globals.vscode.process !== 'undefined') {
@@ -517,8 +1522,17 @@
         _isMacintosh = _userAgent.indexOf('Macintosh') >= 0;
         (_userAgent.indexOf('Macintosh') >= 0 || _userAgent.indexOf('iPad') >= 0 || _userAgent.indexOf('iPhone') >= 0) && !!navigator.maxTouchPoints && navigator.maxTouchPoints > 0;
         _isLinux = _userAgent.indexOf('Linux') >= 0;
-        _locale = navigator.language;
+        (_userAgent === null || _userAgent === void 0 ? void 0 : _userAgent.indexOf('Mobi')) >= 0;
+        _isWeb = true;
+        getConfiguredDefaultLocale(
+        // This call _must_ be done in the file that calls `nls.getConfiguredDefaultLocale`
+        // to ensure that the NLS AMD Loader plugin has been loaded and configured.
+        // This is because the loader plugin decides what the default locale is based on
+        // how it's able to resolve the strings.
+        localize$1({ key: 'ensureLoaderPluginIsLoaded', comment: ['{Locked}'] }, '_'));
+        _locale = LANGUAGE_DEFAULT;
         _language = _locale;
+        _platformLocale = navigator.language;
     }
     // Native environment
     else if (typeof nodeProcess === 'object') {
@@ -526,6 +1540,7 @@
         _isMacintosh = (nodeProcess.platform === 'darwin');
         _isLinux = (nodeProcess.platform === 'linux');
         _isLinux && !!nodeProcess.env['SNAP'] && !!nodeProcess.env['SNAP_REVISION'];
+        !!nodeProcess.env['CI'] || !!nodeProcess.env['BUILD_ARTIFACTSTAGINGDIRECTORY'];
         _locale = LANGUAGE_DEFAULT;
         _language = LANGUAGE_DEFAULT;
         const rawNlsConfig = nodeProcess.env['VSCODE_NLS_CONFIG'];
@@ -534,6 +1549,7 @@
                 const nlsConfig = JSON.parse(rawNlsConfig);
                 const resolved = nlsConfig.availableLanguages['*'];
                 _locale = nlsConfig.locale;
+                _platformLocale = nlsConfig.osLocale;
                 // VSCode's default language is 'en'
                 _language = resolved ? resolved : LANGUAGE_DEFAULT;
                 _translationsConfigFile = nlsConfig._translationsConfigFile;
@@ -548,8 +1564,9 @@
     }
     const isWindows = _isWindows;
     const isMacintosh = _isMacintosh;
-    const isLinux = _isLinux;
+    (_isWeb && typeof globals.importScripts === 'function');
     const userAgent = _userAgent;
+    const setTimeout0IsFaster = (typeof globals.postMessage === 'function' && !globals.importScripts);
     /**
      * See https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#:~:text=than%204%2C%20then-,set%20timeout%20to%204,-.
      *
@@ -557,8 +1574,8 @@
      * that browsers set when the nesting level is > 5.
      */
     (() => {
-        if (typeof globals.postMessage === 'function' && !globals.importScripts) {
-            let pending = [];
+        if (setTimeout0IsFaster) {
+            const pending = [];
             globals.addEventListener('message', (e) => {
                 if (e.data && e.data.vscodeScheduleAsyncWork) {
                     for (let i = 0, len = pending.length; i < len; i++) {
@@ -589,519 +1606,14 @@
     !!(userAgent && userAgent.indexOf('Edg/') >= 0);
     !!(userAgent && userAgent.indexOf('Android') >= 0);
 
-    /*---------------------------------------------------------------------------------------------
-     *  Copyright (c) Microsoft Corporation. All rights reserved.
-     *  Licensed under the MIT License. See License.txt in the project root for license information.
-     *--------------------------------------------------------------------------------------------*/
-    const hasPerformanceNow = (globals.performance && typeof globals.performance.now === 'function');
-    class StopWatch {
-        constructor(highResolution) {
-            this._highResolution = hasPerformanceNow && highResolution;
-            this._startTime = this._now();
-            this._stopTime = -1;
-        }
-        static create(highResolution = true) {
-            return new StopWatch(highResolution);
-        }
-        stop() {
-            this._stopTime = this._now();
-        }
-        elapsed() {
-            if (this._stopTime !== -1) {
-                return this._stopTime - this._startTime;
-            }
-            return this._now() - this._startTime;
-        }
-        _now() {
-            return this._highResolution ? globals.performance.now() : Date.now();
-        }
-    }
-
-    var Event;
-    (function (Event) {
-        Event.None = () => Disposable.None;
-        /**
-         * Given an event, returns another event which only fires once.
-         */
-        function once(event) {
-            return (listener, thisArgs = null, disposables) => {
-                // we need this, in case the event fires during the listener call
-                let didFire = false;
-                let result;
-                result = event(e => {
-                    if (didFire) {
-                        return;
-                    }
-                    else if (result) {
-                        result.dispose();
-                    }
-                    else {
-                        didFire = true;
-                    }
-                    return listener.call(thisArgs, e);
-                }, null, disposables);
-                if (didFire) {
-                    result.dispose();
-                }
-                return result;
-            };
-        }
-        Event.once = once;
-        /**
-         * @deprecated DO NOT use, this leaks memory
-         */
-        function map(event, map) {
-            return snapshot((listener, thisArgs = null, disposables) => event(i => listener.call(thisArgs, map(i)), null, disposables));
-        }
-        Event.map = map;
-        /**
-         * @deprecated DO NOT use, this leaks memory
-         */
-        function forEach(event, each) {
-            return snapshot((listener, thisArgs = null, disposables) => event(i => { each(i); listener.call(thisArgs, i); }, null, disposables));
-        }
-        Event.forEach = forEach;
-        function filter(event, filter) {
-            return snapshot((listener, thisArgs = null, disposables) => event(e => filter(e) && listener.call(thisArgs, e), null, disposables));
-        }
-        Event.filter = filter;
-        /**
-         * Given an event, returns the same event but typed as `Event<void>`.
-         */
-        function signal(event) {
-            return event;
-        }
-        Event.signal = signal;
-        function any(...events) {
-            return (listener, thisArgs = null, disposables) => combinedDisposable(...events.map(event => event(e => listener.call(thisArgs, e), null, disposables)));
-        }
-        Event.any = any;
-        /**
-         * @deprecated DO NOT use, this leaks memory
-         */
-        function reduce(event, merge, initial) {
-            let output = initial;
-            return map(event, e => {
-                output = merge(output, e);
-                return output;
-            });
-        }
-        Event.reduce = reduce;
-        /**
-         * @deprecated DO NOT use, this leaks memory
-         */
-        function snapshot(event) {
-            let listener;
-            const emitter = new Emitter({
-                onFirstListenerAdd() {
-                    listener = event(emitter.fire, emitter);
-                },
-                onLastListenerRemove() {
-                    listener.dispose();
-                }
-            });
-            return emitter.event;
-        }
-        function debouncedListener(event, listener, merge, delay = 100, leading = false) {
-            let output = undefined;
-            let handle = undefined;
-            let numDebouncedCalls = 0;
-            return event(cur => {
-                numDebouncedCalls++;
-                output = merge(output, cur);
-                if (leading && !handle) {
-                    listener(output);
-                    output = undefined;
-                }
-                clearTimeout(handle);
-                handle = setTimeout(() => {
-                    const _output = output;
-                    output = undefined;
-                    handle = undefined;
-                    if (!leading || numDebouncedCalls > 1) {
-                        listener(_output);
-                    }
-                    numDebouncedCalls = 0;
-                }, delay);
-            });
-        }
-        Event.debouncedListener = debouncedListener;
-        /**
-         * @deprecated this leaks memory, {@link debouncedListener} or {@link DebounceEmitter} instead
-         */
-        function debounce(event, merge, delay = 100, leading = false, leakWarningThreshold) {
-            let subscription;
-            let output = undefined;
-            let handle = undefined;
-            let numDebouncedCalls = 0;
-            const emitter = new Emitter({
-                leakWarningThreshold,
-                onFirstListenerAdd() {
-                    subscription = event(cur => {
-                        numDebouncedCalls++;
-                        output = merge(output, cur);
-                        if (leading && !handle) {
-                            emitter.fire(output);
-                            output = undefined;
-                        }
-                        clearTimeout(handle);
-                        handle = setTimeout(() => {
-                            const _output = output;
-                            output = undefined;
-                            handle = undefined;
-                            if (!leading || numDebouncedCalls > 1) {
-                                emitter.fire(_output);
-                            }
-                            numDebouncedCalls = 0;
-                        }, delay);
-                    });
-                },
-                onLastListenerRemove() {
-                    subscription.dispose();
-                }
-            });
-            return emitter.event;
-        }
-        Event.debounce = debounce;
-        /**
-         * @deprecated DO NOT use, this leaks memory
-         */
-        function latch(event, equals = (a, b) => a === b) {
-            let firstCall = true;
-            let cache;
-            return filter(event, value => {
-                const shouldEmit = firstCall || !equals(value, cache);
-                firstCall = false;
-                cache = value;
-                return shouldEmit;
-            });
-        }
-        Event.latch = latch;
-        /**
-         * @deprecated DO NOT use, this leaks memory
-         */
-        function split(event, isT) {
-            return [
-                Event.filter(event, isT),
-                Event.filter(event, e => !isT(e)),
-            ];
-        }
-        Event.split = split;
-        /**
-         * @deprecated DO NOT use, this leaks memory
-         */
-        function buffer(event, flushAfterTimeout = false, _buffer = []) {
-            let buffer = _buffer.slice();
-            let listener = event(e => {
-                if (buffer) {
-                    buffer.push(e);
-                }
-                else {
-                    emitter.fire(e);
-                }
-            });
-            const flush = () => {
-                if (buffer) {
-                    buffer.forEach(e => emitter.fire(e));
-                }
-                buffer = null;
-            };
-            const emitter = new Emitter({
-                onFirstListenerAdd() {
-                    if (!listener) {
-                        listener = event(e => emitter.fire(e));
-                    }
-                },
-                onFirstListenerDidAdd() {
-                    if (buffer) {
-                        if (flushAfterTimeout) {
-                            setTimeout(flush);
-                        }
-                        else {
-                            flush();
-                        }
-                    }
-                },
-                onLastListenerRemove() {
-                    if (listener) {
-                        listener.dispose();
-                    }
-                    listener = null;
-                }
-            });
-            return emitter.event;
-        }
-        Event.buffer = buffer;
-        class ChainableEvent {
-            constructor(event) {
-                this.event = event;
-            }
-            map(fn) {
-                return new ChainableEvent(map(this.event, fn));
-            }
-            forEach(fn) {
-                return new ChainableEvent(forEach(this.event, fn));
-            }
-            filter(fn) {
-                return new ChainableEvent(filter(this.event, fn));
-            }
-            reduce(merge, initial) {
-                return new ChainableEvent(reduce(this.event, merge, initial));
-            }
-            latch() {
-                return new ChainableEvent(latch(this.event));
-            }
-            debounce(merge, delay = 100, leading = false, leakWarningThreshold) {
-                return new ChainableEvent(debounce(this.event, merge, delay, leading, leakWarningThreshold));
-            }
-            on(listener, thisArgs, disposables) {
-                return this.event(listener, thisArgs, disposables);
-            }
-            once(listener, thisArgs, disposables) {
-                return once(this.event)(listener, thisArgs, disposables);
-            }
-        }
-        /**
-         * @deprecated DO NOT use, this leaks memory
-         */
-        function chain(event) {
-            return new ChainableEvent(event);
-        }
-        Event.chain = chain;
-        function fromNodeEventEmitter(emitter, eventName, map = id => id) {
-            const fn = (...args) => result.fire(map(...args));
-            const onFirstListenerAdd = () => emitter.on(eventName, fn);
-            const onLastListenerRemove = () => emitter.removeListener(eventName, fn);
-            const result = new Emitter({ onFirstListenerAdd, onLastListenerRemove });
-            return result.event;
-        }
-        Event.fromNodeEventEmitter = fromNodeEventEmitter;
-        function fromDOMEventEmitter(emitter, eventName, map = id => id) {
-            const fn = (...args) => result.fire(map(...args));
-            const onFirstListenerAdd = () => emitter.addEventListener(eventName, fn);
-            const onLastListenerRemove = () => emitter.removeEventListener(eventName, fn);
-            const result = new Emitter({ onFirstListenerAdd, onLastListenerRemove });
-            return result.event;
-        }
-        Event.fromDOMEventEmitter = fromDOMEventEmitter;
-        function toPromise(event) {
-            return new Promise(resolve => once(event)(resolve));
-        }
-        Event.toPromise = toPromise;
-        function runAndSubscribe(event, handler) {
-            handler(undefined);
-            return event(e => handler(e));
-        }
-        Event.runAndSubscribe = runAndSubscribe;
-        function runAndSubscribeWithStore(event, handler) {
-            let store = null;
-            function run(e) {
-                store === null || store === void 0 ? void 0 : store.dispose();
-                store = new DisposableStore();
-                handler(e, store);
-            }
-            run(undefined);
-            const disposable = event(e => run(e));
-            return toDisposable(() => {
-                disposable.dispose();
-                store === null || store === void 0 ? void 0 : store.dispose();
-            });
-        }
-        Event.runAndSubscribeWithStore = runAndSubscribeWithStore;
-    })(Event || (Event = {}));
-    class EventProfiling {
-        constructor(name) {
-            this._listenerCount = 0;
-            this._invocationCount = 0;
-            this._elapsedOverall = 0;
-            this._name = `${name}_${EventProfiling._idPool++}`;
-        }
-        start(listenerCount) {
-            this._stopWatch = new StopWatch(true);
-            this._listenerCount = listenerCount;
-        }
-        stop() {
-            if (this._stopWatch) {
-                const elapsed = this._stopWatch.elapsed();
-                this._elapsedOverall += elapsed;
-                this._invocationCount += 1;
-                console.info(`did FIRE ${this._name}: elapsed_ms: ${elapsed.toFixed(5)}, listener: ${this._listenerCount} (elapsed_overall: ${this._elapsedOverall.toFixed(2)}, invocations: ${this._invocationCount})`);
-                this._stopWatch = undefined;
-            }
-        }
-    }
-    EventProfiling._idPool = 0;
-    /**
-     * The Emitter can be used to expose an Event to the public
-     * to fire it from the insides.
-     * Sample:
-        class Document {
-
-            private readonly _onDidChange = new Emitter<(value:string)=>any>();
-
-            public onDidChange = this._onDidChange.event;
-
-            // getter-style
-            // get onDidChange(): Event<(value:string)=>any> {
-            // 	return this._onDidChange.event;
-            // }
-
-            private _doIt() {
-                //...
-                this._onDidChange.fire(value);
-            }
-        }
-     */
-    class Emitter {
-        constructor(options) {
-            var _a;
-            this._disposed = false;
-            this._options = options;
-            this._leakageMon = undefined;
-            this._perfMon = ((_a = this._options) === null || _a === void 0 ? void 0 : _a._profName) ? new EventProfiling(this._options._profName) : undefined;
-        }
-        /**
-         * For the public to allow to subscribe
-         * to events from this Emitter
-         */
-        get event() {
-            if (!this._event) {
-                this._event = (listener, thisArgs, disposables) => {
-                    var _a;
-                    if (!this._listeners) {
-                        this._listeners = new LinkedList();
-                    }
-                    const firstListener = this._listeners.isEmpty();
-                    if (firstListener && this._options && this._options.onFirstListenerAdd) {
-                        this._options.onFirstListenerAdd(this);
-                    }
-                    const remove = this._listeners.push(!thisArgs ? listener : [listener, thisArgs]);
-                    if (firstListener && this._options && this._options.onFirstListenerDidAdd) {
-                        this._options.onFirstListenerDidAdd(this);
-                    }
-                    if (this._options && this._options.onListenerDidAdd) {
-                        this._options.onListenerDidAdd(this, listener, thisArgs);
-                    }
-                    // check and record this emitter for potential leakage
-                    const removeMonitor = (_a = this._leakageMon) === null || _a === void 0 ? void 0 : _a.check(this._listeners.size);
-                    const result = toDisposable(() => {
-                        if (removeMonitor) {
-                            removeMonitor();
-                        }
-                        if (!this._disposed) {
-                            remove();
-                            if (this._options && this._options.onLastListenerRemove) {
-                                const hasListeners = (this._listeners && !this._listeners.isEmpty());
-                                if (!hasListeners) {
-                                    this._options.onLastListenerRemove(this);
-                                }
-                            }
-                        }
-                    });
-                    if (disposables instanceof DisposableStore) {
-                        disposables.add(result);
-                    }
-                    else if (Array.isArray(disposables)) {
-                        disposables.push(result);
-                    }
-                    return result;
-                };
-            }
-            return this._event;
-        }
-        /**
-         * To be kept private to fire an event to
-         * subscribers
-         */
-        fire(event) {
-            var _a, _b;
-            if (this._listeners) {
-                // put all [listener,event]-pairs into delivery queue
-                // then emit all event. an inner/nested event might be
-                // the driver of this
-                if (!this._deliveryQueue) {
-                    this._deliveryQueue = new LinkedList();
-                }
-                for (let listener of this._listeners) {
-                    this._deliveryQueue.push([listener, event]);
-                }
-                // start/stop performance insight collection
-                (_a = this._perfMon) === null || _a === void 0 ? void 0 : _a.start(this._deliveryQueue.size);
-                while (this._deliveryQueue.size > 0) {
-                    const [listener, event] = this._deliveryQueue.shift();
-                    try {
-                        if (typeof listener === 'function') {
-                            listener.call(undefined, event);
-                        }
-                        else {
-                            listener[0].call(listener[1], event);
-                        }
-                    }
-                    catch (e) {
-                        onUnexpectedError(e);
-                    }
-                }
-                (_b = this._perfMon) === null || _b === void 0 ? void 0 : _b.stop();
-            }
-        }
-        dispose() {
-            var _a, _b, _c, _d, _e;
-            if (!this._disposed) {
-                this._disposed = true;
-                (_a = this._listeners) === null || _a === void 0 ? void 0 : _a.clear();
-                (_b = this._deliveryQueue) === null || _b === void 0 ? void 0 : _b.clear();
-                (_d = (_c = this._options) === null || _c === void 0 ? void 0 : _c.onLastListenerRemove) === null || _d === void 0 ? void 0 : _d.call(_c);
-                (_e = this._leakageMon) === null || _e === void 0 ? void 0 : _e.dispose();
-            }
-        }
-    }
-
-    /**
-     * @returns whether the provided parameter is a JavaScript Array or not.
-     */
-    function getAllPropertyNames(obj) {
-        let res = [];
-        let proto = Object.getPrototypeOf(obj);
-        while (Object.prototype !== proto) {
-            res = res.concat(Object.getOwnPropertyNames(proto));
-            proto = Object.getPrototypeOf(proto);
-        }
-        return res;
-    }
-    function getAllMethodNames(obj) {
-        const methods = [];
-        for (const prop of getAllPropertyNames(obj)) {
-            if (typeof obj[prop] === 'function') {
-                methods.push(prop);
-            }
-        }
-        return methods;
-    }
-    function createProxyObject$1(methodNames, invoke) {
-        const createProxyMethod = (method) => {
-            return function () {
-                const args = Array.prototype.slice.call(arguments, 0);
-                return invoke(method, args);
-            };
-        };
-        let result = {};
-        for (const methodName of methodNames) {
-            result[methodName] = createProxyMethod(methodName);
-        }
-        return result;
-    }
-    function assertNever(value, message = 'Unreachable') {
-        throw new Error(message);
-    }
-
     /**
      * Uses a LRU cache to make a given parametrized function cached.
      * Caches just the last value.
      * The key must be JSON serializable.
     */
-    class LRUCachedComputed {
-        constructor(computeFn) {
-            this.computeFn = computeFn;
+    class LRUCachedFunction {
+        constructor(fn) {
+            this.fn = fn;
             this.lastCache = undefined;
             this.lastArgKey = undefined;
         }
@@ -1109,7 +1621,7 @@
             const key = JSON.stringify(arg);
             if (this.lastArgKey !== key) {
                 this.lastArgKey = key;
-                this.lastCache = this.computeFn(arg);
+                this.lastCache = this.fn(arg);
             }
             return this.lastCache;
         }
@@ -1130,7 +1642,7 @@
          * This will force evaluation of the lazy value if it has not been resolved yet. Lazy values are only
          * resolved once. `getValue` will re-throw exceptions that are hit while resolving the value
          */
-        getValue() {
+        get value() {
             if (!this._didRun) {
                 try {
                     this._value = this.executor();
@@ -1174,7 +1686,7 @@
     function firstNonWhitespaceIndex(str) {
         for (let i = 0, len = str.length; i < len; i++) {
             const chCode = str.charCodeAt(i);
-            if (chCode !== 32 /* Space */ && chCode !== 9 /* Tab */) {
+            if (chCode !== 32 /* CharCode.Space */ && chCode !== 9 /* CharCode.Tab */) {
                 return i;
             }
         }
@@ -1187,82 +1699,14 @@
     function lastNonWhitespaceIndex(str, startIndex = str.length - 1) {
         for (let i = startIndex; i >= 0; i--) {
             const chCode = str.charCodeAt(i);
-            if (chCode !== 32 /* Space */ && chCode !== 9 /* Tab */) {
+            if (chCode !== 32 /* CharCode.Space */ && chCode !== 9 /* CharCode.Tab */) {
                 return i;
             }
         }
         return -1;
     }
-    function compareSubstring(a, b, aStart = 0, aEnd = a.length, bStart = 0, bEnd = b.length) {
-        for (; aStart < aEnd && bStart < bEnd; aStart++, bStart++) {
-            let codeA = a.charCodeAt(aStart);
-            let codeB = b.charCodeAt(bStart);
-            if (codeA < codeB) {
-                return -1;
-            }
-            else if (codeA > codeB) {
-                return 1;
-            }
-        }
-        const aLen = aEnd - aStart;
-        const bLen = bEnd - bStart;
-        if (aLen < bLen) {
-            return -1;
-        }
-        else if (aLen > bLen) {
-            return 1;
-        }
-        return 0;
-    }
-    function compareSubstringIgnoreCase(a, b, aStart = 0, aEnd = a.length, bStart = 0, bEnd = b.length) {
-        for (; aStart < aEnd && bStart < bEnd; aStart++, bStart++) {
-            let codeA = a.charCodeAt(aStart);
-            let codeB = b.charCodeAt(bStart);
-            if (codeA === codeB) {
-                // equal
-                continue;
-            }
-            if (codeA >= 128 || codeB >= 128) {
-                // not ASCII letters -> fallback to lower-casing strings
-                return compareSubstring(a.toLowerCase(), b.toLowerCase(), aStart, aEnd, bStart, bEnd);
-            }
-            // mapper lower-case ascii letter onto upper-case varinats
-            // [97-122] (lower ascii) --> [65-90] (upper ascii)
-            if (isLowerAsciiLetter(codeA)) {
-                codeA -= 32;
-            }
-            if (isLowerAsciiLetter(codeB)) {
-                codeB -= 32;
-            }
-            // compare both code points
-            const diff = codeA - codeB;
-            if (diff === 0) {
-                continue;
-            }
-            return diff;
-        }
-        const aLen = aEnd - aStart;
-        const bLen = bEnd - bStart;
-        if (aLen < bLen) {
-            return -1;
-        }
-        else if (aLen > bLen) {
-            return 1;
-        }
-        return 0;
-    }
-    function isLowerAsciiLetter(code) {
-        return code >= 97 /* a */ && code <= 122 /* z */;
-    }
     function isUpperAsciiLetter(code) {
-        return code >= 65 /* A */ && code <= 90 /* Z */;
-    }
-    function startsWithIgnoreCase(str, candidate) {
-        const candidateLength = candidate.length;
-        if (candidate.length > str.length) {
-            return false;
-        }
-        return compareSubstringIgnoreCase(str, candidate, 0, candidateLength) === 0;
+        return code >= 65 /* CharCode.A */ && code <= 90 /* CharCode.Z */;
     }
     /**
      * See http://en.wikipedia.org/wiki/Surrogate_pair
@@ -1295,15 +1739,22 @@
         }
         return charCode;
     }
+    const IS_BASIC_ASCII = /^[\t\n\r\x20-\x7E]*$/;
+    /**
+     * Returns true if `str` contains only basic ASCII characters in the range 32 - 126 (including 32 and 126) or \n, \r, \t
+     */
+    function isBasicASCII(str) {
+        return IS_BASIC_ASCII.test(str);
+    }
     class AmbiguousCharacters {
-        constructor(confusableDictionary) {
-            this.confusableDictionary = confusableDictionary;
-        }
         static getInstance(locales) {
             return AmbiguousCharacters.cache.get(Array.from(locales));
         }
         static getLocales() {
-            return AmbiguousCharacters._locales.getValue();
+            return AmbiguousCharacters._locales.value;
+        }
+        constructor(confusableDictionary) {
+            this.confusableDictionary = confusableDictionary;
         }
         isAmbiguous(codePoint) {
             return this.confusableDictionary.has(codePoint);
@@ -1323,9 +1774,9 @@
     AmbiguousCharacters.ambiguousCharacterData = new Lazy(() => {
         // Generated using https://github.com/hediet/vscode-unicode-data
         // Stored as key1, value1, key2, value2, ...
-        return JSON.parse('{\"_common\":[8232,32,8233,32,5760,32,8192,32,8193,32,8194,32,8195,32,8196,32,8197,32,8198,32,8200,32,8201,32,8202,32,8287,32,8199,32,8239,32,2042,95,65101,95,65102,95,65103,95,8208,45,8209,45,8210,45,65112,45,1748,45,8259,45,727,45,8722,45,10134,45,11450,45,1549,44,1643,44,8218,44,184,44,42233,44,894,59,2307,58,2691,58,1417,58,1795,58,1796,58,5868,58,65072,58,6147,58,6153,58,8282,58,1475,58,760,58,42889,58,8758,58,720,58,42237,58,451,33,11601,33,660,63,577,63,2429,63,5038,63,42731,63,119149,46,8228,46,1793,46,1794,46,42510,46,68176,46,1632,46,1776,46,42232,46,1373,96,65287,96,8219,96,8242,96,1370,96,1523,96,8175,96,65344,96,900,96,8189,96,8125,96,8127,96,8190,96,697,96,884,96,712,96,714,96,715,96,756,96,699,96,701,96,700,96,702,96,42892,96,1497,96,2036,96,2037,96,5194,96,5836,96,94033,96,94034,96,65339,91,10088,40,10098,40,12308,40,64830,40,65341,93,10089,41,10099,41,12309,41,64831,41,10100,123,119060,123,10101,125,65342,94,8270,42,1645,42,8727,42,66335,42,5941,47,8257,47,8725,47,8260,47,9585,47,10187,47,10744,47,119354,47,12755,47,12339,47,11462,47,20031,47,12035,47,65340,92,65128,92,8726,92,10189,92,10741,92,10745,92,119311,92,119355,92,12756,92,20022,92,12034,92,42872,38,708,94,710,94,5869,43,10133,43,66203,43,8249,60,10094,60,706,60,119350,60,5176,60,5810,60,5120,61,11840,61,12448,61,42239,61,8250,62,10095,62,707,62,119351,62,5171,62,94015,62,8275,126,732,126,8128,126,8764,126,65372,124,65293,45,120784,50,120794,50,120804,50,120814,50,120824,50,130034,50,42842,50,423,50,1000,50,42564,50,5311,50,42735,50,119302,51,120785,51,120795,51,120805,51,120815,51,120825,51,130035,51,42923,51,540,51,439,51,42858,51,11468,51,1248,51,94011,51,71882,51,120786,52,120796,52,120806,52,120816,52,120826,52,130036,52,5070,52,71855,52,120787,53,120797,53,120807,53,120817,53,120827,53,130037,53,444,53,71867,53,120788,54,120798,54,120808,54,120818,54,120828,54,130038,54,11474,54,5102,54,71893,54,119314,55,120789,55,120799,55,120809,55,120819,55,120829,55,130039,55,66770,55,71878,55,2819,56,2538,56,2666,56,125131,56,120790,56,120800,56,120810,56,120820,56,120830,56,130040,56,547,56,546,56,66330,56,2663,57,2920,57,2541,57,3437,57,120791,57,120801,57,120811,57,120821,57,120831,57,130041,57,42862,57,11466,57,71884,57,71852,57,71894,57,9082,97,65345,97,119834,97,119886,97,119938,97,119990,97,120042,97,120094,97,120146,97,120198,97,120250,97,120302,97,120354,97,120406,97,120458,97,593,97,945,97,120514,97,120572,97,120630,97,120688,97,120746,97,65313,65,119808,65,119860,65,119912,65,119964,65,120016,65,120068,65,120120,65,120172,65,120224,65,120276,65,120328,65,120380,65,120432,65,913,65,120488,65,120546,65,120604,65,120662,65,120720,65,5034,65,5573,65,42222,65,94016,65,66208,65,119835,98,119887,98,119939,98,119991,98,120043,98,120095,98,120147,98,120199,98,120251,98,120303,98,120355,98,120407,98,120459,98,388,98,5071,98,5234,98,5551,98,65314,66,8492,66,119809,66,119861,66,119913,66,120017,66,120069,66,120121,66,120173,66,120225,66,120277,66,120329,66,120381,66,120433,66,42932,66,914,66,120489,66,120547,66,120605,66,120663,66,120721,66,5108,66,5623,66,42192,66,66178,66,66209,66,66305,66,65347,99,8573,99,119836,99,119888,99,119940,99,119992,99,120044,99,120096,99,120148,99,120200,99,120252,99,120304,99,120356,99,120408,99,120460,99,7428,99,1010,99,11429,99,43951,99,66621,99,128844,67,71922,67,71913,67,65315,67,8557,67,8450,67,8493,67,119810,67,119862,67,119914,67,119966,67,120018,67,120174,67,120226,67,120278,67,120330,67,120382,67,120434,67,1017,67,11428,67,5087,67,42202,67,66210,67,66306,67,66581,67,66844,67,8574,100,8518,100,119837,100,119889,100,119941,100,119993,100,120045,100,120097,100,120149,100,120201,100,120253,100,120305,100,120357,100,120409,100,120461,100,1281,100,5095,100,5231,100,42194,100,8558,68,8517,68,119811,68,119863,68,119915,68,119967,68,120019,68,120071,68,120123,68,120175,68,120227,68,120279,68,120331,68,120383,68,120435,68,5024,68,5598,68,5610,68,42195,68,8494,101,65349,101,8495,101,8519,101,119838,101,119890,101,119942,101,120046,101,120098,101,120150,101,120202,101,120254,101,120306,101,120358,101,120410,101,120462,101,43826,101,1213,101,8959,69,65317,69,8496,69,119812,69,119864,69,119916,69,120020,69,120072,69,120124,69,120176,69,120228,69,120280,69,120332,69,120384,69,120436,69,917,69,120492,69,120550,69,120608,69,120666,69,120724,69,11577,69,5036,69,42224,69,71846,69,71854,69,66182,69,119839,102,119891,102,119943,102,119995,102,120047,102,120099,102,120151,102,120203,102,120255,102,120307,102,120359,102,120411,102,120463,102,43829,102,42905,102,383,102,7837,102,1412,102,119315,70,8497,70,119813,70,119865,70,119917,70,120021,70,120073,70,120125,70,120177,70,120229,70,120281,70,120333,70,120385,70,120437,70,42904,70,988,70,120778,70,5556,70,42205,70,71874,70,71842,70,66183,70,66213,70,66853,70,65351,103,8458,103,119840,103,119892,103,119944,103,120048,103,120100,103,120152,103,120204,103,120256,103,120308,103,120360,103,120412,103,120464,103,609,103,7555,103,397,103,1409,103,119814,71,119866,71,119918,71,119970,71,120022,71,120074,71,120126,71,120178,71,120230,71,120282,71,120334,71,120386,71,120438,71,1292,71,5056,71,5107,71,42198,71,65352,104,8462,104,119841,104,119945,104,119997,104,120049,104,120101,104,120153,104,120205,104,120257,104,120309,104,120361,104,120413,104,120465,104,1211,104,1392,104,5058,104,65320,72,8459,72,8460,72,8461,72,119815,72,119867,72,119919,72,120023,72,120179,72,120231,72,120283,72,120335,72,120387,72,120439,72,919,72,120494,72,120552,72,120610,72,120668,72,120726,72,11406,72,5051,72,5500,72,42215,72,66255,72,731,105,9075,105,65353,105,8560,105,8505,105,8520,105,119842,105,119894,105,119946,105,119998,105,120050,105,120102,105,120154,105,120206,105,120258,105,120310,105,120362,105,120414,105,120466,105,120484,105,618,105,617,105,953,105,8126,105,890,105,120522,105,120580,105,120638,105,120696,105,120754,105,1110,105,42567,105,1231,105,43893,105,5029,105,71875,105,65354,106,8521,106,119843,106,119895,106,119947,106,119999,106,120051,106,120103,106,120155,106,120207,106,120259,106,120311,106,120363,106,120415,106,120467,106,1011,106,1112,106,65322,74,119817,74,119869,74,119921,74,119973,74,120025,74,120077,74,120129,74,120181,74,120233,74,120285,74,120337,74,120389,74,120441,74,42930,74,895,74,1032,74,5035,74,5261,74,42201,74,119844,107,119896,107,119948,107,120000,107,120052,107,120104,107,120156,107,120208,107,120260,107,120312,107,120364,107,120416,107,120468,107,8490,75,65323,75,119818,75,119870,75,119922,75,119974,75,120026,75,120078,75,120130,75,120182,75,120234,75,120286,75,120338,75,120390,75,120442,75,922,75,120497,75,120555,75,120613,75,120671,75,120729,75,11412,75,5094,75,5845,75,42199,75,66840,75,1472,108,8739,73,9213,73,65512,73,1633,108,1777,73,66336,108,125127,108,120783,73,120793,73,120803,73,120813,73,120823,73,130033,73,65321,73,8544,73,8464,73,8465,73,119816,73,119868,73,119920,73,120024,73,120128,73,120180,73,120232,73,120284,73,120336,73,120388,73,120440,73,65356,108,8572,73,8467,108,119845,108,119897,108,119949,108,120001,108,120053,108,120105,73,120157,73,120209,73,120261,73,120313,73,120365,73,120417,73,120469,73,448,73,120496,73,120554,73,120612,73,120670,73,120728,73,11410,73,1030,73,1216,73,1493,108,1503,108,1575,108,126464,108,126592,108,65166,108,65165,108,1994,108,11599,73,5825,73,42226,73,93992,73,66186,124,66313,124,119338,76,8556,76,8466,76,119819,76,119871,76,119923,76,120027,76,120079,76,120131,76,120183,76,120235,76,120287,76,120339,76,120391,76,120443,76,11472,76,5086,76,5290,76,42209,76,93974,76,71843,76,71858,76,66587,76,66854,76,65325,77,8559,77,8499,77,119820,77,119872,77,119924,77,120028,77,120080,77,120132,77,120184,77,120236,77,120288,77,120340,77,120392,77,120444,77,924,77,120499,77,120557,77,120615,77,120673,77,120731,77,1018,77,11416,77,5047,77,5616,77,5846,77,42207,77,66224,77,66321,77,119847,110,119899,110,119951,110,120003,110,120055,110,120107,110,120159,110,120211,110,120263,110,120315,110,120367,110,120419,110,120471,110,1400,110,1404,110,65326,78,8469,78,119821,78,119873,78,119925,78,119977,78,120029,78,120081,78,120185,78,120237,78,120289,78,120341,78,120393,78,120445,78,925,78,120500,78,120558,78,120616,78,120674,78,120732,78,11418,78,42208,78,66835,78,3074,111,3202,111,3330,111,3458,111,2406,111,2662,111,2790,111,3046,111,3174,111,3302,111,3430,111,3664,111,3792,111,4160,111,1637,111,1781,111,65359,111,8500,111,119848,111,119900,111,119952,111,120056,111,120108,111,120160,111,120212,111,120264,111,120316,111,120368,111,120420,111,120472,111,7439,111,7441,111,43837,111,959,111,120528,111,120586,111,120644,111,120702,111,120760,111,963,111,120532,111,120590,111,120648,111,120706,111,120764,111,11423,111,4351,111,1413,111,1505,111,1607,111,126500,111,126564,111,126596,111,65259,111,65260,111,65258,111,65257,111,1726,111,64428,111,64429,111,64427,111,64426,111,1729,111,64424,111,64425,111,64423,111,64422,111,1749,111,3360,111,4125,111,66794,111,71880,111,71895,111,66604,111,1984,79,2534,79,2918,79,12295,79,70864,79,71904,79,120782,79,120792,79,120802,79,120812,79,120822,79,130032,79,65327,79,119822,79,119874,79,119926,79,119978,79,120030,79,120082,79,120134,79,120186,79,120238,79,120290,79,120342,79,120394,79,120446,79,927,79,120502,79,120560,79,120618,79,120676,79,120734,79,11422,79,1365,79,11604,79,4816,79,2848,79,66754,79,42227,79,71861,79,66194,79,66219,79,66564,79,66838,79,9076,112,65360,112,119849,112,119901,112,119953,112,120005,112,120057,112,120109,112,120161,112,120213,112,120265,112,120317,112,120369,112,120421,112,120473,112,961,112,120530,112,120544,112,120588,112,120602,112,120646,112,120660,112,120704,112,120718,112,120762,112,120776,112,11427,112,65328,80,8473,80,119823,80,119875,80,119927,80,119979,80,120031,80,120083,80,120187,80,120239,80,120291,80,120343,80,120395,80,120447,80,929,80,120504,80,120562,80,120620,80,120678,80,120736,80,11426,80,5090,80,5229,80,42193,80,66197,80,119850,113,119902,113,119954,113,120006,113,120058,113,120110,113,120162,113,120214,113,120266,113,120318,113,120370,113,120422,113,120474,113,1307,113,1379,113,1382,113,8474,81,119824,81,119876,81,119928,81,119980,81,120032,81,120084,81,120188,81,120240,81,120292,81,120344,81,120396,81,120448,81,11605,81,119851,114,119903,114,119955,114,120007,114,120059,114,120111,114,120163,114,120215,114,120267,114,120319,114,120371,114,120423,114,120475,114,43847,114,43848,114,7462,114,11397,114,43905,114,119318,82,8475,82,8476,82,8477,82,119825,82,119877,82,119929,82,120033,82,120189,82,120241,82,120293,82,120345,82,120397,82,120449,82,422,82,5025,82,5074,82,66740,82,5511,82,42211,82,94005,82,65363,115,119852,115,119904,115,119956,115,120008,115,120060,115,120112,115,120164,115,120216,115,120268,115,120320,115,120372,115,120424,115,120476,115,42801,115,445,115,1109,115,43946,115,71873,115,66632,115,65331,83,119826,83,119878,83,119930,83,119982,83,120034,83,120086,83,120138,83,120190,83,120242,83,120294,83,120346,83,120398,83,120450,83,1029,83,1359,83,5077,83,5082,83,42210,83,94010,83,66198,83,66592,83,119853,116,119905,116,119957,116,120009,116,120061,116,120113,116,120165,116,120217,116,120269,116,120321,116,120373,116,120425,116,120477,116,8868,84,10201,84,128872,84,65332,84,119827,84,119879,84,119931,84,119983,84,120035,84,120087,84,120139,84,120191,84,120243,84,120295,84,120347,84,120399,84,120451,84,932,84,120507,84,120565,84,120623,84,120681,84,120739,84,11430,84,5026,84,42196,84,93962,84,71868,84,66199,84,66225,84,66325,84,119854,117,119906,117,119958,117,120010,117,120062,117,120114,117,120166,117,120218,117,120270,117,120322,117,120374,117,120426,117,120478,117,42911,117,7452,117,43854,117,43858,117,651,117,965,117,120534,117,120592,117,120650,117,120708,117,120766,117,1405,117,66806,117,71896,117,8746,85,8899,85,119828,85,119880,85,119932,85,119984,85,120036,85,120088,85,120140,85,120192,85,120244,85,120296,85,120348,85,120400,85,120452,85,1357,85,4608,85,66766,85,5196,85,42228,85,94018,85,71864,85,8744,118,8897,118,65366,118,8564,118,119855,118,119907,118,119959,118,120011,118,120063,118,120115,118,120167,118,120219,118,120271,118,120323,118,120375,118,120427,118,120479,118,7456,118,957,118,120526,118,120584,118,120642,118,120700,118,120758,118,1141,118,1496,118,71430,118,43945,118,71872,118,119309,86,1639,86,1783,86,8548,86,119829,86,119881,86,119933,86,119985,86,120037,86,120089,86,120141,86,120193,86,120245,86,120297,86,120349,86,120401,86,120453,86,1140,86,11576,86,5081,86,5167,86,42719,86,42214,86,93960,86,71840,86,66845,86,623,119,119856,119,119908,119,119960,119,120012,119,120064,119,120116,119,120168,119,120220,119,120272,119,120324,119,120376,119,120428,119,120480,119,7457,119,1121,119,1309,119,1377,119,71434,119,71438,119,71439,119,43907,119,71919,87,71910,87,119830,87,119882,87,119934,87,119986,87,120038,87,120090,87,120142,87,120194,87,120246,87,120298,87,120350,87,120402,87,120454,87,1308,87,5043,87,5076,87,42218,87,5742,120,10539,120,10540,120,10799,120,65368,120,8569,120,119857,120,119909,120,119961,120,120013,120,120065,120,120117,120,120169,120,120221,120,120273,120,120325,120,120377,120,120429,120,120481,120,5441,120,5501,120,5741,88,9587,88,66338,88,71916,88,65336,88,8553,88,119831,88,119883,88,119935,88,119987,88,120039,88,120091,88,120143,88,120195,88,120247,88,120299,88,120351,88,120403,88,120455,88,42931,88,935,88,120510,88,120568,88,120626,88,120684,88,120742,88,11436,88,11613,88,5815,88,42219,88,66192,88,66228,88,66327,88,66855,88,611,121,7564,121,65369,121,119858,121,119910,121,119962,121,120014,121,120066,121,120118,121,120170,121,120222,121,120274,121,120326,121,120378,121,120430,121,120482,121,655,121,7935,121,43866,121,947,121,8509,121,120516,121,120574,121,120632,121,120690,121,120748,121,1199,121,4327,121,71900,121,65337,89,119832,89,119884,89,119936,89,119988,89,120040,89,120092,89,120144,89,120196,89,120248,89,120300,89,120352,89,120404,89,120456,89,933,89,978,89,120508,89,120566,89,120624,89,120682,89,120740,89,11432,89,1198,89,5033,89,5053,89,42220,89,94019,89,71844,89,66226,89,119859,122,119911,122,119963,122,120015,122,120067,122,120119,122,120171,122,120223,122,120275,122,120327,122,120379,122,120431,122,120483,122,7458,122,43923,122,71876,122,66293,90,71909,90,65338,90,8484,90,8488,90,119833,90,119885,90,119937,90,119989,90,120041,90,120197,90,120249,90,120301,90,120353,90,120405,90,120457,90,918,90,120493,90,120551,90,120609,90,120667,90,120725,90,5059,90,42204,90,71849,90,65282,34,65284,36,65285,37,65286,38,65290,42,65291,43,65294,46,65295,47,65296,48,65297,49,65298,50,65299,51,65300,52,65301,53,65302,54,65303,55,65304,56,65305,57,65308,60,65309,61,65310,62,65312,64,65316,68,65318,70,65319,71,65324,76,65329,81,65330,82,65333,85,65334,86,65335,87,65343,95,65346,98,65348,100,65350,102,65355,107,65357,109,65358,110,65361,113,65362,114,65364,116,65365,117,65367,119,65370,122,65371,123,65373,125],\"_default\":[160,32,8211,45,65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"cs\":[65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"de\":[65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"es\":[8211,45,65374,126,65306,58,65281,33,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"fr\":[65374,126,65306,58,65281,33,8216,96,8245,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"it\":[160,32,8211,45,65374,126,65306,58,65281,33,8216,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"ja\":[8211,45,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65292,44,65307,59],\"ko\":[8211,45,65374,126,65306,58,65281,33,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"pl\":[65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"pt-BR\":[65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"qps-ploc\":[160,32,8211,45,65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"ru\":[65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,305,105,921,73,1009,112,215,120,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"tr\":[160,32,8211,45,65374,126,65306,58,65281,33,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"zh-hans\":[65374,126,65306,58,65281,33,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65288,40,65289,41],\"zh-hant\":[8211,45,65374,126,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65307,59]}');
+        return JSON.parse('{\"_common\":[8232,32,8233,32,5760,32,8192,32,8193,32,8194,32,8195,32,8196,32,8197,32,8198,32,8200,32,8201,32,8202,32,8287,32,8199,32,8239,32,2042,95,65101,95,65102,95,65103,95,8208,45,8209,45,8210,45,65112,45,1748,45,8259,45,727,45,8722,45,10134,45,11450,45,1549,44,1643,44,8218,44,184,44,42233,44,894,59,2307,58,2691,58,1417,58,1795,58,1796,58,5868,58,65072,58,6147,58,6153,58,8282,58,1475,58,760,58,42889,58,8758,58,720,58,42237,58,451,33,11601,33,660,63,577,63,2429,63,5038,63,42731,63,119149,46,8228,46,1793,46,1794,46,42510,46,68176,46,1632,46,1776,46,42232,46,1373,96,65287,96,8219,96,8242,96,1370,96,1523,96,8175,96,65344,96,900,96,8189,96,8125,96,8127,96,8190,96,697,96,884,96,712,96,714,96,715,96,756,96,699,96,701,96,700,96,702,96,42892,96,1497,96,2036,96,2037,96,5194,96,5836,96,94033,96,94034,96,65339,91,10088,40,10098,40,12308,40,64830,40,65341,93,10089,41,10099,41,12309,41,64831,41,10100,123,119060,123,10101,125,65342,94,8270,42,1645,42,8727,42,66335,42,5941,47,8257,47,8725,47,8260,47,9585,47,10187,47,10744,47,119354,47,12755,47,12339,47,11462,47,20031,47,12035,47,65340,92,65128,92,8726,92,10189,92,10741,92,10745,92,119311,92,119355,92,12756,92,20022,92,12034,92,42872,38,708,94,710,94,5869,43,10133,43,66203,43,8249,60,10094,60,706,60,119350,60,5176,60,5810,60,5120,61,11840,61,12448,61,42239,61,8250,62,10095,62,707,62,119351,62,5171,62,94015,62,8275,126,732,126,8128,126,8764,126,65372,124,65293,45,120784,50,120794,50,120804,50,120814,50,120824,50,130034,50,42842,50,423,50,1000,50,42564,50,5311,50,42735,50,119302,51,120785,51,120795,51,120805,51,120815,51,120825,51,130035,51,42923,51,540,51,439,51,42858,51,11468,51,1248,51,94011,51,71882,51,120786,52,120796,52,120806,52,120816,52,120826,52,130036,52,5070,52,71855,52,120787,53,120797,53,120807,53,120817,53,120827,53,130037,53,444,53,71867,53,120788,54,120798,54,120808,54,120818,54,120828,54,130038,54,11474,54,5102,54,71893,54,119314,55,120789,55,120799,55,120809,55,120819,55,120829,55,130039,55,66770,55,71878,55,2819,56,2538,56,2666,56,125131,56,120790,56,120800,56,120810,56,120820,56,120830,56,130040,56,547,56,546,56,66330,56,2663,57,2920,57,2541,57,3437,57,120791,57,120801,57,120811,57,120821,57,120831,57,130041,57,42862,57,11466,57,71884,57,71852,57,71894,57,9082,97,65345,97,119834,97,119886,97,119938,97,119990,97,120042,97,120094,97,120146,97,120198,97,120250,97,120302,97,120354,97,120406,97,120458,97,593,97,945,97,120514,97,120572,97,120630,97,120688,97,120746,97,65313,65,119808,65,119860,65,119912,65,119964,65,120016,65,120068,65,120120,65,120172,65,120224,65,120276,65,120328,65,120380,65,120432,65,913,65,120488,65,120546,65,120604,65,120662,65,120720,65,5034,65,5573,65,42222,65,94016,65,66208,65,119835,98,119887,98,119939,98,119991,98,120043,98,120095,98,120147,98,120199,98,120251,98,120303,98,120355,98,120407,98,120459,98,388,98,5071,98,5234,98,5551,98,65314,66,8492,66,119809,66,119861,66,119913,66,120017,66,120069,66,120121,66,120173,66,120225,66,120277,66,120329,66,120381,66,120433,66,42932,66,914,66,120489,66,120547,66,120605,66,120663,66,120721,66,5108,66,5623,66,42192,66,66178,66,66209,66,66305,66,65347,99,8573,99,119836,99,119888,99,119940,99,119992,99,120044,99,120096,99,120148,99,120200,99,120252,99,120304,99,120356,99,120408,99,120460,99,7428,99,1010,99,11429,99,43951,99,66621,99,128844,67,71922,67,71913,67,65315,67,8557,67,8450,67,8493,67,119810,67,119862,67,119914,67,119966,67,120018,67,120174,67,120226,67,120278,67,120330,67,120382,67,120434,67,1017,67,11428,67,5087,67,42202,67,66210,67,66306,67,66581,67,66844,67,8574,100,8518,100,119837,100,119889,100,119941,100,119993,100,120045,100,120097,100,120149,100,120201,100,120253,100,120305,100,120357,100,120409,100,120461,100,1281,100,5095,100,5231,100,42194,100,8558,68,8517,68,119811,68,119863,68,119915,68,119967,68,120019,68,120071,68,120123,68,120175,68,120227,68,120279,68,120331,68,120383,68,120435,68,5024,68,5598,68,5610,68,42195,68,8494,101,65349,101,8495,101,8519,101,119838,101,119890,101,119942,101,120046,101,120098,101,120150,101,120202,101,120254,101,120306,101,120358,101,120410,101,120462,101,43826,101,1213,101,8959,69,65317,69,8496,69,119812,69,119864,69,119916,69,120020,69,120072,69,120124,69,120176,69,120228,69,120280,69,120332,69,120384,69,120436,69,917,69,120492,69,120550,69,120608,69,120666,69,120724,69,11577,69,5036,69,42224,69,71846,69,71854,69,66182,69,119839,102,119891,102,119943,102,119995,102,120047,102,120099,102,120151,102,120203,102,120255,102,120307,102,120359,102,120411,102,120463,102,43829,102,42905,102,383,102,7837,102,1412,102,119315,70,8497,70,119813,70,119865,70,119917,70,120021,70,120073,70,120125,70,120177,70,120229,70,120281,70,120333,70,120385,70,120437,70,42904,70,988,70,120778,70,5556,70,42205,70,71874,70,71842,70,66183,70,66213,70,66853,70,65351,103,8458,103,119840,103,119892,103,119944,103,120048,103,120100,103,120152,103,120204,103,120256,103,120308,103,120360,103,120412,103,120464,103,609,103,7555,103,397,103,1409,103,119814,71,119866,71,119918,71,119970,71,120022,71,120074,71,120126,71,120178,71,120230,71,120282,71,120334,71,120386,71,120438,71,1292,71,5056,71,5107,71,42198,71,65352,104,8462,104,119841,104,119945,104,119997,104,120049,104,120101,104,120153,104,120205,104,120257,104,120309,104,120361,104,120413,104,120465,104,1211,104,1392,104,5058,104,65320,72,8459,72,8460,72,8461,72,119815,72,119867,72,119919,72,120023,72,120179,72,120231,72,120283,72,120335,72,120387,72,120439,72,919,72,120494,72,120552,72,120610,72,120668,72,120726,72,11406,72,5051,72,5500,72,42215,72,66255,72,731,105,9075,105,65353,105,8560,105,8505,105,8520,105,119842,105,119894,105,119946,105,119998,105,120050,105,120102,105,120154,105,120206,105,120258,105,120310,105,120362,105,120414,105,120466,105,120484,105,618,105,617,105,953,105,8126,105,890,105,120522,105,120580,105,120638,105,120696,105,120754,105,1110,105,42567,105,1231,105,43893,105,5029,105,71875,105,65354,106,8521,106,119843,106,119895,106,119947,106,119999,106,120051,106,120103,106,120155,106,120207,106,120259,106,120311,106,120363,106,120415,106,120467,106,1011,106,1112,106,65322,74,119817,74,119869,74,119921,74,119973,74,120025,74,120077,74,120129,74,120181,74,120233,74,120285,74,120337,74,120389,74,120441,74,42930,74,895,74,1032,74,5035,74,5261,74,42201,74,119844,107,119896,107,119948,107,120000,107,120052,107,120104,107,120156,107,120208,107,120260,107,120312,107,120364,107,120416,107,120468,107,8490,75,65323,75,119818,75,119870,75,119922,75,119974,75,120026,75,120078,75,120130,75,120182,75,120234,75,120286,75,120338,75,120390,75,120442,75,922,75,120497,75,120555,75,120613,75,120671,75,120729,75,11412,75,5094,75,5845,75,42199,75,66840,75,1472,108,8739,73,9213,73,65512,73,1633,108,1777,73,66336,108,125127,108,120783,73,120793,73,120803,73,120813,73,120823,73,130033,73,65321,73,8544,73,8464,73,8465,73,119816,73,119868,73,119920,73,120024,73,120128,73,120180,73,120232,73,120284,73,120336,73,120388,73,120440,73,65356,108,8572,73,8467,108,119845,108,119897,108,119949,108,120001,108,120053,108,120105,73,120157,73,120209,73,120261,73,120313,73,120365,73,120417,73,120469,73,448,73,120496,73,120554,73,120612,73,120670,73,120728,73,11410,73,1030,73,1216,73,1493,108,1503,108,1575,108,126464,108,126592,108,65166,108,65165,108,1994,108,11599,73,5825,73,42226,73,93992,73,66186,124,66313,124,119338,76,8556,76,8466,76,119819,76,119871,76,119923,76,120027,76,120079,76,120131,76,120183,76,120235,76,120287,76,120339,76,120391,76,120443,76,11472,76,5086,76,5290,76,42209,76,93974,76,71843,76,71858,76,66587,76,66854,76,65325,77,8559,77,8499,77,119820,77,119872,77,119924,77,120028,77,120080,77,120132,77,120184,77,120236,77,120288,77,120340,77,120392,77,120444,77,924,77,120499,77,120557,77,120615,77,120673,77,120731,77,1018,77,11416,77,5047,77,5616,77,5846,77,42207,77,66224,77,66321,77,119847,110,119899,110,119951,110,120003,110,120055,110,120107,110,120159,110,120211,110,120263,110,120315,110,120367,110,120419,110,120471,110,1400,110,1404,110,65326,78,8469,78,119821,78,119873,78,119925,78,119977,78,120029,78,120081,78,120185,78,120237,78,120289,78,120341,78,120393,78,120445,78,925,78,120500,78,120558,78,120616,78,120674,78,120732,78,11418,78,42208,78,66835,78,3074,111,3202,111,3330,111,3458,111,2406,111,2662,111,2790,111,3046,111,3174,111,3302,111,3430,111,3664,111,3792,111,4160,111,1637,111,1781,111,65359,111,8500,111,119848,111,119900,111,119952,111,120056,111,120108,111,120160,111,120212,111,120264,111,120316,111,120368,111,120420,111,120472,111,7439,111,7441,111,43837,111,959,111,120528,111,120586,111,120644,111,120702,111,120760,111,963,111,120532,111,120590,111,120648,111,120706,111,120764,111,11423,111,4351,111,1413,111,1505,111,1607,111,126500,111,126564,111,126596,111,65259,111,65260,111,65258,111,65257,111,1726,111,64428,111,64429,111,64427,111,64426,111,1729,111,64424,111,64425,111,64423,111,64422,111,1749,111,3360,111,4125,111,66794,111,71880,111,71895,111,66604,111,1984,79,2534,79,2918,79,12295,79,70864,79,71904,79,120782,79,120792,79,120802,79,120812,79,120822,79,130032,79,65327,79,119822,79,119874,79,119926,79,119978,79,120030,79,120082,79,120134,79,120186,79,120238,79,120290,79,120342,79,120394,79,120446,79,927,79,120502,79,120560,79,120618,79,120676,79,120734,79,11422,79,1365,79,11604,79,4816,79,2848,79,66754,79,42227,79,71861,79,66194,79,66219,79,66564,79,66838,79,9076,112,65360,112,119849,112,119901,112,119953,112,120005,112,120057,112,120109,112,120161,112,120213,112,120265,112,120317,112,120369,112,120421,112,120473,112,961,112,120530,112,120544,112,120588,112,120602,112,120646,112,120660,112,120704,112,120718,112,120762,112,120776,112,11427,112,65328,80,8473,80,119823,80,119875,80,119927,80,119979,80,120031,80,120083,80,120187,80,120239,80,120291,80,120343,80,120395,80,120447,80,929,80,120504,80,120562,80,120620,80,120678,80,120736,80,11426,80,5090,80,5229,80,42193,80,66197,80,119850,113,119902,113,119954,113,120006,113,120058,113,120110,113,120162,113,120214,113,120266,113,120318,113,120370,113,120422,113,120474,113,1307,113,1379,113,1382,113,8474,81,119824,81,119876,81,119928,81,119980,81,120032,81,120084,81,120188,81,120240,81,120292,81,120344,81,120396,81,120448,81,11605,81,119851,114,119903,114,119955,114,120007,114,120059,114,120111,114,120163,114,120215,114,120267,114,120319,114,120371,114,120423,114,120475,114,43847,114,43848,114,7462,114,11397,114,43905,114,119318,82,8475,82,8476,82,8477,82,119825,82,119877,82,119929,82,120033,82,120189,82,120241,82,120293,82,120345,82,120397,82,120449,82,422,82,5025,82,5074,82,66740,82,5511,82,42211,82,94005,82,65363,115,119852,115,119904,115,119956,115,120008,115,120060,115,120112,115,120164,115,120216,115,120268,115,120320,115,120372,115,120424,115,120476,115,42801,115,445,115,1109,115,43946,115,71873,115,66632,115,65331,83,119826,83,119878,83,119930,83,119982,83,120034,83,120086,83,120138,83,120190,83,120242,83,120294,83,120346,83,120398,83,120450,83,1029,83,1359,83,5077,83,5082,83,42210,83,94010,83,66198,83,66592,83,119853,116,119905,116,119957,116,120009,116,120061,116,120113,116,120165,116,120217,116,120269,116,120321,116,120373,116,120425,116,120477,116,8868,84,10201,84,128872,84,65332,84,119827,84,119879,84,119931,84,119983,84,120035,84,120087,84,120139,84,120191,84,120243,84,120295,84,120347,84,120399,84,120451,84,932,84,120507,84,120565,84,120623,84,120681,84,120739,84,11430,84,5026,84,42196,84,93962,84,71868,84,66199,84,66225,84,66325,84,119854,117,119906,117,119958,117,120010,117,120062,117,120114,117,120166,117,120218,117,120270,117,120322,117,120374,117,120426,117,120478,117,42911,117,7452,117,43854,117,43858,117,651,117,965,117,120534,117,120592,117,120650,117,120708,117,120766,117,1405,117,66806,117,71896,117,8746,85,8899,85,119828,85,119880,85,119932,85,119984,85,120036,85,120088,85,120140,85,120192,85,120244,85,120296,85,120348,85,120400,85,120452,85,1357,85,4608,85,66766,85,5196,85,42228,85,94018,85,71864,85,8744,118,8897,118,65366,118,8564,118,119855,118,119907,118,119959,118,120011,118,120063,118,120115,118,120167,118,120219,118,120271,118,120323,118,120375,118,120427,118,120479,118,7456,118,957,118,120526,118,120584,118,120642,118,120700,118,120758,118,1141,118,1496,118,71430,118,43945,118,71872,118,119309,86,1639,86,1783,86,8548,86,119829,86,119881,86,119933,86,119985,86,120037,86,120089,86,120141,86,120193,86,120245,86,120297,86,120349,86,120401,86,120453,86,1140,86,11576,86,5081,86,5167,86,42719,86,42214,86,93960,86,71840,86,66845,86,623,119,119856,119,119908,119,119960,119,120012,119,120064,119,120116,119,120168,119,120220,119,120272,119,120324,119,120376,119,120428,119,120480,119,7457,119,1121,119,1309,119,1377,119,71434,119,71438,119,71439,119,43907,119,71919,87,71910,87,119830,87,119882,87,119934,87,119986,87,120038,87,120090,87,120142,87,120194,87,120246,87,120298,87,120350,87,120402,87,120454,87,1308,87,5043,87,5076,87,42218,87,5742,120,10539,120,10540,120,10799,120,65368,120,8569,120,119857,120,119909,120,119961,120,120013,120,120065,120,120117,120,120169,120,120221,120,120273,120,120325,120,120377,120,120429,120,120481,120,5441,120,5501,120,5741,88,9587,88,66338,88,71916,88,65336,88,8553,88,119831,88,119883,88,119935,88,119987,88,120039,88,120091,88,120143,88,120195,88,120247,88,120299,88,120351,88,120403,88,120455,88,42931,88,935,88,120510,88,120568,88,120626,88,120684,88,120742,88,11436,88,11613,88,5815,88,42219,88,66192,88,66228,88,66327,88,66855,88,611,121,7564,121,65369,121,119858,121,119910,121,119962,121,120014,121,120066,121,120118,121,120170,121,120222,121,120274,121,120326,121,120378,121,120430,121,120482,121,655,121,7935,121,43866,121,947,121,8509,121,120516,121,120574,121,120632,121,120690,121,120748,121,1199,121,4327,121,71900,121,65337,89,119832,89,119884,89,119936,89,119988,89,120040,89,120092,89,120144,89,120196,89,120248,89,120300,89,120352,89,120404,89,120456,89,933,89,978,89,120508,89,120566,89,120624,89,120682,89,120740,89,11432,89,1198,89,5033,89,5053,89,42220,89,94019,89,71844,89,66226,89,119859,122,119911,122,119963,122,120015,122,120067,122,120119,122,120171,122,120223,122,120275,122,120327,122,120379,122,120431,122,120483,122,7458,122,43923,122,71876,122,66293,90,71909,90,65338,90,8484,90,8488,90,119833,90,119885,90,119937,90,119989,90,120041,90,120197,90,120249,90,120301,90,120353,90,120405,90,120457,90,918,90,120493,90,120551,90,120609,90,120667,90,120725,90,5059,90,42204,90,71849,90,65282,34,65284,36,65285,37,65286,38,65290,42,65291,43,65294,46,65295,47,65296,48,65297,49,65298,50,65299,51,65300,52,65301,53,65302,54,65303,55,65304,56,65305,57,65308,60,65309,61,65310,62,65312,64,65316,68,65318,70,65319,71,65324,76,65329,81,65330,82,65333,85,65334,86,65335,87,65343,95,65346,98,65348,100,65350,102,65355,107,65357,109,65358,110,65361,113,65362,114,65364,116,65365,117,65367,119,65370,122,65371,123,65373,125,119846,109],\"_default\":[160,32,8211,45,65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"cs\":[65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"de\":[65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"es\":[8211,45,65374,126,65306,58,65281,33,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"fr\":[65374,126,65306,58,65281,33,8216,96,8245,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"it\":[160,32,8211,45,65374,126,65306,58,65281,33,8216,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"ja\":[8211,45,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65292,44,65307,59],\"ko\":[8211,45,65374,126,65306,58,65281,33,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"pl\":[65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"pt-BR\":[65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"qps-ploc\":[160,32,8211,45,65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"ru\":[65374,126,65306,58,65281,33,8216,96,8217,96,8245,96,180,96,12494,47,305,105,921,73,1009,112,215,120,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"tr\":[160,32,8211,45,65374,126,65306,58,65281,33,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65288,40,65289,41,65292,44,65307,59,65311,63],\"zh-hans\":[65374,126,65306,58,65281,33,8245,96,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65288,40,65289,41],\"zh-hant\":[8211,45,65374,126,180,96,12494,47,1047,51,1073,54,1072,97,1040,65,1068,98,1042,66,1089,99,1057,67,1077,101,1045,69,1053,72,305,105,1050,75,921,73,1052,77,1086,111,1054,79,1009,112,1088,112,1056,80,1075,114,1058,84,215,120,1093,120,1061,88,1091,121,1059,89,65283,35,65307,59]}');
     });
-    AmbiguousCharacters.cache = new LRUCachedComputed((locales) => {
+    AmbiguousCharacters.cache = new LRUCachedFunction((locales) => {
         function arrayToMap(arr) {
             const result = new Map();
             for (let i = 0; i < arr.length; i += 2) {
@@ -1352,7 +1803,7 @@
             }
             return result;
         }
-        const data = _a$1.ambiguousCharacterData.getValue();
+        const data = _a$1.ambiguousCharacterData.value;
         let filteredLocales = locales.filter((l) => !l.startsWith('_') && l in data);
         if (filteredLocales.length === 0) {
             filteredLocales = ['_default'];
@@ -1366,7 +1817,7 @@
         const map = mergeMaps(commonMap, languageSpecificMap);
         return new AmbiguousCharacters(map);
     });
-    AmbiguousCharacters._locales = new Lazy(() => Object.keys(AmbiguousCharacters.ambiguousCharacterData.getValue()).filter((k) => !k.startsWith('_')));
+    AmbiguousCharacters._locales = new Lazy(() => Object.keys(AmbiguousCharacters.ambiguousCharacterData.value).filter((k) => !k.startsWith('_')));
     class InvisibleCharacters {
         static getRawData() {
             // Generated using https://github.com/hediet/vscode-unicode-data
@@ -1398,7 +1849,7 @@
             this.req = req;
             this.method = method;
             this.args = args;
-            this.type = 0 /* Request */;
+            this.type = 0 /* MessageType.Request */;
         }
     }
     class ReplyMessage {
@@ -1407,7 +1858,7 @@
             this.seq = seq;
             this.res = res;
             this.err = err;
-            this.type = 1 /* Reply */;
+            this.type = 1 /* MessageType.Reply */;
         }
     }
     class SubscribeEventMessage {
@@ -1416,7 +1867,7 @@
             this.req = req;
             this.eventName = eventName;
             this.arg = arg;
-            this.type = 2 /* SubscribeEvent */;
+            this.type = 2 /* MessageType.SubscribeEvent */;
         }
     }
     class EventMessage {
@@ -1424,14 +1875,14 @@
             this.vsWorker = vsWorker;
             this.req = req;
             this.event = event;
-            this.type = 3 /* Event */;
+            this.type = 3 /* MessageType.Event */;
         }
     }
     class UnsubscribeEventMessage {
         constructor(vsWorker, req) {
             this.vsWorker = vsWorker;
             this.req = req;
-            this.type = 4 /* UnsubscribeEvent */;
+            this.type = 4 /* MessageType.UnsubscribeEvent */;
         }
     }
     class SimpleWorkerProtocol {
@@ -1459,12 +1910,12 @@
         listen(eventName, arg) {
             let req = null;
             const emitter = new Emitter({
-                onFirstListenerAdd: () => {
+                onWillAddFirstListener: () => {
                     req = String(++this._lastSentReq);
                     this._pendingEmitters.set(req, emitter);
                     this._send(new SubscribeEventMessage(this._workerId, req, eventName, arg));
                 },
-                onLastListenerRemove: () => {
+                onDidRemoveLastListener: () => {
                     this._pendingEmitters.delete(req);
                     this._send(new UnsubscribeEventMessage(this._workerId, req));
                     req = null;
@@ -1483,15 +1934,15 @@
         }
         _handleMessage(msg) {
             switch (msg.type) {
-                case 1 /* Reply */:
+                case 1 /* MessageType.Reply */:
                     return this._handleReplyMessage(msg);
-                case 0 /* Request */:
+                case 0 /* MessageType.Request */:
                     return this._handleRequestMessage(msg);
-                case 2 /* SubscribeEvent */:
+                case 2 /* MessageType.SubscribeEvent */:
                     return this._handleSubscribeEventMessage(msg);
-                case 3 /* Event */:
+                case 3 /* MessageType.Event */:
                     return this._handleEventMessage(msg);
-                case 4 /* UnsubscribeEvent */:
+                case 4 /* MessageType.UnsubscribeEvent */:
                     return this._handleUnsubscribeEventMessage(msg);
             }
         }
@@ -1500,7 +1951,7 @@
                 console.warn('Got reply to unknown seq');
                 return;
             }
-            let reply = this._pendingReplies[replyMessage.seq];
+            const reply = this._pendingReplies[replyMessage.seq];
             delete this._pendingReplies[replyMessage.seq];
             if (replyMessage.err) {
                 let err = replyMessage.err;
@@ -1516,8 +1967,8 @@
             reply.resolve(replyMessage.res);
         }
         _handleRequestMessage(requestMessage) {
-            let req = requestMessage.req;
-            let result = this._handler.handleMessage(requestMessage.method, requestMessage.args);
+            const req = requestMessage.req;
+            const result = this._handler.handleMessage(requestMessage.method, requestMessage.args);
             result.then((r) => {
                 this._send(new ReplyMessage(this._workerId, req, r, undefined));
             }, (e) => {
@@ -1551,15 +2002,15 @@
             this._pendingEvents.delete(msg.req);
         }
         _send(msg) {
-            let transfer = [];
-            if (msg.type === 0 /* Request */) {
+            const transfer = [];
+            if (msg.type === 0 /* MessageType.Request */) {
                 for (let i = 0; i < msg.args.length; i++) {
                     if (msg.args[i] instanceof ArrayBuffer) {
                         transfer.push(msg.args[i]);
                     }
                 }
             }
-            else if (msg.type === 1 /* Reply */) {
+            else if (msg.type === 1 /* MessageType.Reply */) {
                 if (msg.res instanceof ArrayBuffer) {
                     transfer.push(msg.res);
                 }
@@ -1587,7 +2038,7 @@
                 return proxyListen(eventName, arg);
             };
         };
-        let result = {};
+        const result = {};
         for (const methodName of methodNames) {
             if (propertyIsDynamicEvent(methodName)) {
                 result[methodName] = createProxyDynamicEvent(methodName);
@@ -1683,15 +2134,15 @@
                 }
                 // Since this is in a web worker, enable catching errors
                 loaderConfig.catchError = true;
-                globals.require.config(loaderConfig);
+                globalThis.require.config(loaderConfig);
             }
             return new Promise((resolve, reject) => {
                 // Use the global require to be sure to get the global config
                 // ESM-comment-begin
-                // 			const req = (globals.require || require);
+                // 			const req = (globalThis.require || require);
                 // ESM-comment-end
                 // ESM-uncomment-begin
-                const req = globals.require;
+                const req = globalThis.require;
                 // ESM-uncomment-end
                 req([moduleId], (module) => {
                     this._requestHandler = module.create(hostProxy);
@@ -1824,8 +2275,8 @@
          */
         constructor() {
             this.m_changes = [];
-            this.m_originalStart = 1073741824 /* MAX_SAFE_SMALL_INTEGER */;
-            this.m_modifiedStart = 1073741824 /* MAX_SAFE_SMALL_INTEGER */;
+            this.m_originalStart = 1073741824 /* Constants.MAX_SAFE_SMALL_INTEGER */;
+            this.m_modifiedStart = 1073741824 /* Constants.MAX_SAFE_SMALL_INTEGER */;
             this.m_originalCount = 0;
             this.m_modifiedCount = 0;
         }
@@ -1841,8 +2292,8 @@
             // Reset for the next change
             this.m_originalCount = 0;
             this.m_modifiedCount = 0;
-            this.m_originalStart = 1073741824 /* MAX_SAFE_SMALL_INTEGER */;
-            this.m_modifiedStart = 1073741824 /* MAX_SAFE_SMALL_INTEGER */;
+            this.m_originalStart = 1073741824 /* Constants.MAX_SAFE_SMALL_INTEGER */;
+            this.m_modifiedStart = 1073741824 /* Constants.MAX_SAFE_SMALL_INTEGER */;
         }
         /**
          * Adds the original element at the given position to the elements
@@ -2070,7 +2521,7 @@
             let diagonalMin = diagonalForwardStart;
             let diagonalMax = diagonalForwardEnd;
             let diagonalRelative = (midOriginalArr[0] - midModifiedArr[0]) - diagonalForwardOffset;
-            let lastOriginalIndex = -1073741824 /* MIN_SAFE_SMALL_INTEGER */;
+            let lastOriginalIndex = -1073741824 /* Constants.MIN_SAFE_SMALL_INTEGER */;
             let historyIndex = this.m_forwardHistory.length - 1;
             do {
                 // Get the diagonal index from the relative diagonal number
@@ -2128,7 +2579,7 @@
                 diagonalMin = diagonalReverseStart;
                 diagonalMax = diagonalReverseEnd;
                 diagonalRelative = (midOriginalArr[0] - midModifiedArr[0]) - diagonalReverseOffset;
-                lastOriginalIndex = 1073741824 /* MAX_SAFE_SMALL_INTEGER */;
+                lastOriginalIndex = 1073741824 /* Constants.MAX_SAFE_SMALL_INTEGER */;
                 historyIndex = (deltaIsEven) ? this.m_reverseHistory.length - 1 : this.m_reverseHistory.length - 2;
                 do {
                     // Get the diagonal index from the relative diagonal number
@@ -2274,7 +2725,7 @@
                         if (originalIndex >= reversePoints[diagonal]) {
                             midOriginalArr[0] = originalIndex;
                             midModifiedArr[0] = modifiedIndex;
-                            if (tempOriginalIndex <= reversePoints[diagonal] && 1447 /* MaxDifferencesHistory */ > 0 && numDifferences <= (1447 /* MaxDifferencesHistory */ + 1)) {
+                            if (tempOriginalIndex <= reversePoints[diagonal] && 1447 /* LocalConstants.MaxDifferencesHistory */ > 0 && numDifferences <= (1447 /* LocalConstants.MaxDifferencesHistory */ + 1)) {
                                 // BINGO! We overlapped, and we have the full trace in memory!
                                 return this.WALKTRACE(diagonalForwardBase, diagonalForwardStart, diagonalForwardEnd, diagonalForwardOffset, diagonalReverseBase, diagonalReverseStart, diagonalReverseEnd, diagonalReverseOffset, forwardPoints, reversePoints, originalIndex, originalEnd, midOriginalArr, modifiedIndex, modifiedEnd, midModifiedArr, deltaIsEven, quitEarlyArr);
                             }
@@ -2294,7 +2745,7 @@
                     // Use the furthest distance we got in the forward direction.
                     midOriginalArr[0] = furthestOriginalIndex;
                     midModifiedArr[0] = furthestModifiedIndex;
-                    if (matchLengthOfLongest > 0 && 1447 /* MaxDifferencesHistory */ > 0 && numDifferences <= (1447 /* MaxDifferencesHistory */ + 1)) {
+                    if (matchLengthOfLongest > 0 && 1447 /* LocalConstants.MaxDifferencesHistory */ > 0 && numDifferences <= (1447 /* LocalConstants.MaxDifferencesHistory */ + 1)) {
                         // Enough of the history is in memory to walk it backwards
                         return this.WALKTRACE(diagonalForwardBase, diagonalForwardStart, diagonalForwardEnd, diagonalForwardOffset, diagonalReverseBase, diagonalReverseStart, diagonalReverseEnd, diagonalReverseOffset, forwardPoints, reversePoints, originalIndex, originalEnd, midOriginalArr, modifiedIndex, modifiedEnd, midModifiedArr, deltaIsEven, quitEarlyArr);
                     }
@@ -2339,7 +2790,7 @@
                         if (originalIndex <= forwardPoints[diagonal]) {
                             midOriginalArr[0] = originalIndex;
                             midModifiedArr[0] = modifiedIndex;
-                            if (tempOriginalIndex >= forwardPoints[diagonal] && 1447 /* MaxDifferencesHistory */ > 0 && numDifferences <= (1447 /* MaxDifferencesHistory */ + 1)) {
+                            if (tempOriginalIndex >= forwardPoints[diagonal] && 1447 /* LocalConstants.MaxDifferencesHistory */ > 0 && numDifferences <= (1447 /* LocalConstants.MaxDifferencesHistory */ + 1)) {
                                 // BINGO! We overlapped, and we have the full trace in memory!
                                 return this.WALKTRACE(diagonalForwardBase, diagonalForwardStart, diagonalForwardEnd, diagonalForwardOffset, diagonalReverseBase, diagonalReverseStart, diagonalReverseEnd, diagonalReverseOffset, forwardPoints, reversePoints, originalIndex, originalEnd, midOriginalArr, modifiedIndex, modifiedEnd, midModifiedArr, deltaIsEven, quitEarlyArr);
                             }
@@ -2352,7 +2803,7 @@
                     }
                 }
                 // Save current vectors to history before the next iteration
-                if (numDifferences <= 1447 /* MaxDifferencesHistory */) {
+                if (numDifferences <= 1447 /* LocalConstants.MaxDifferencesHistory */) {
                     // We are allocating space for one extra int, which we fill with
                     // the index of the diagonal base index
                     let temp = new Int32Array(diagonalForwardEnd - diagonalForwardStart + 2);
@@ -2398,7 +2849,7 @@
                     change.originalStart++;
                     change.modifiedStart++;
                 }
-                let mergedChangeArr = [null];
+                const mergedChangeArr = [null];
                 if (i < changes.length - 1 && this.ChangesOverlap(changes[i], changes[i + 1], mergedChangeArr)) {
                     changes[i] = mergedChangeArr[0];
                     changes.splice(i + 1, 1);
@@ -2566,7 +3017,7 @@
          * @returns The concatenated list
          */
         ConcatenateChanges(left, right) {
-            let mergedChangeArr = [];
+            const mergedChangeArr = [];
             if (left.length === 0 || right.length === 0) {
                 return (right.length > 0) ? right : left;
             }
@@ -2691,6 +3142,8 @@
      * environments.
      *
      * Note: in web, this property is hardcoded to be `/`.
+     *
+     * @skipMangle
      */
     const cwd = safeProcess.cwd;
     /**
@@ -2737,11 +3190,17 @@
             this.code = 'ERR_INVALID_ARG_TYPE';
         }
     }
+    function validateObject(pathObject, name) {
+        if (pathObject === null || typeof pathObject !== 'object') {
+            throw new ErrorInvalidArgType(name, 'Object', pathObject);
+        }
+    }
     function validateString(value, name) {
         if (typeof value !== 'string') {
             throw new ErrorInvalidArgType(name, 'string', value);
         }
     }
+    const platformIsWin32 = (platform === 'win32');
     function isPathSeparator(code) {
         return code === CHAR_FORWARD_SLASH || code === CHAR_BACKWARD_SLASH;
     }
@@ -2824,9 +3283,7 @@
         return res;
     }
     function _format(sep, pathObject) {
-        if (pathObject === null || typeof pathObject !== 'object') {
-            throw new ErrorInvalidArgType('pathObject', 'Object', pathObject);
-        }
+        validateObject(pathObject, 'pathObject');
         const dir = pathObject.dir || pathObject.root;
         const base = pathObject.base ||
             `${pathObject.name || ''}${pathObject.ext || ''}`;
@@ -3249,11 +3706,8 @@
         },
         toNamespacedPath(path) {
             // Note: this will *probably* throw somewhere.
-            if (typeof path !== 'string') {
+            if (typeof path !== 'string' || path.length === 0) {
                 return path;
-            }
-            if (path.length === 0) {
-                return '';
             }
             const resolvedPath = win32.resolve(path);
             if (resolvedPath.length <= 2) {
@@ -3660,13 +4114,26 @@
         win32: null,
         posix: null
     };
+    const posixCwd = (() => {
+        if (platformIsWin32) {
+            // Converts Windows' backslash path separators to POSIX forward slashes
+            // and truncates any drive indicator
+            const regexp = /\\/g;
+            return () => {
+                const cwd$1 = cwd().replace(regexp, '/');
+                return cwd$1.slice(cwd$1.indexOf('/'));
+            };
+        }
+        // We're already on POSIX, no need for any transformations
+        return () => cwd();
+    })();
     const posix = {
         // path.resolve([from ...], to)
         resolve(...pathSegments) {
             let resolvedPath = '';
             let resolvedAbsolute = false;
             for (let i = pathSegments.length - 1; i >= -1 && !resolvedAbsolute; i--) {
-                const path = i >= 0 ? pathSegments[i] : cwd();
+                const path = i >= 0 ? pathSegments[i] : posixCwd();
                 validateString(path, 'path');
                 // Skip empty entries
                 if (path.length === 0) {
@@ -4051,13 +4518,13 @@
     };
     posix.win32 = win32.win32 = win32;
     posix.posix = win32.posix = posix;
-    const normalize = (platform === 'win32' ? win32.normalize : posix.normalize);
-    (platform === 'win32' ? win32.resolve : posix.resolve);
-    (platform === 'win32' ? win32.relative : posix.relative);
-    (platform === 'win32' ? win32.dirname : posix.dirname);
-    const basename = (platform === 'win32' ? win32.basename : posix.basename);
-    const extname = (platform === 'win32' ? win32.extname : posix.extname);
-    const sep = (platform === 'win32' ? win32.sep : posix.sep);
+    (platformIsWin32 ? win32.normalize : posix.normalize);
+    (platformIsWin32 ? win32.resolve : posix.resolve);
+    (platformIsWin32 ? win32.relative : posix.relative);
+    (platformIsWin32 ? win32.dirname : posix.dirname);
+    (platformIsWin32 ? win32.basename : posix.basename);
+    (platformIsWin32 ? win32.extname : posix.extname);
+    (platformIsWin32 ? win32.sep : posix.sep);
 
     /*---------------------------------------------------------------------------------------------
      *  Copyright (c) Microsoft Corporation. All rights reserved.
@@ -4144,6 +4611,22 @@
      * ```
      */
     class URI$1 {
+        static isUri(thing) {
+            if (thing instanceof URI$1) {
+                return true;
+            }
+            if (!thing) {
+                return false;
+            }
+            return typeof thing.authority === 'string'
+                && typeof thing.fragment === 'string'
+                && typeof thing.path === 'string'
+                && typeof thing.query === 'string'
+                && typeof thing.scheme === 'string'
+                && typeof thing.fsPath === 'string'
+                && typeof thing.with === 'function'
+                && typeof thing.toString === 'function';
+        }
         /**
          * @internal
          */
@@ -4166,22 +4649,6 @@
                 this.fragment = fragment || _empty;
                 _validateUri(this, _strict);
             }
-        }
-        static isUri(thing) {
-            if (thing instanceof URI$1) {
-                return true;
-            }
-            if (!thing) {
-                return false;
-            }
-            return typeof thing.authority === 'string'
-                && typeof thing.fragment === 'string'
-                && typeof thing.path === 'string'
-                && typeof thing.query === 'string'
-                && typeof thing.scheme === 'string'
-                && typeof thing.fsPath === 'string'
-                && typeof thing.with === 'function'
-                && typeof thing.toString === 'function';
         }
         // ---- filesystem path -----------------------
         /**
@@ -4317,9 +4784,15 @@
             }
             return new Uri('file', authority, path, _empty, _empty);
         }
-        static from(components) {
-            const result = new Uri(components.scheme, components.authority, components.path, components.query, components.fragment);
-            _validateUri(result, true);
+        /**
+         * Creates new URI from uri components.
+         *
+         * Unless `strict` is `true` the scheme is defaults to be `file`. This function performs
+         * validation and should be used for untrusted uri components retrieved from storage,
+         * user input, command arguments etc
+         */
+        static from(components, strict) {
+            const result = new Uri(components.scheme, components.authority, components.path, components.query, components.fragment, strict);
             return result;
         }
         /**
@@ -4361,6 +4834,7 @@
             return this;
         }
         static revive(data) {
+            var _a, _b;
             if (!data) {
                 return data;
             }
@@ -4369,8 +4843,8 @@
             }
             else {
                 const result = new Uri(data);
-                result._formatted = data.external;
-                result._fsPath = data._sep === _pathSepMarker ? data.fsPath : null;
+                result._formatted = (_a = data.external) !== null && _a !== void 0 ? _a : null;
+                result._fsPath = data._sep === _pathSepMarker ? (_b = data.fsPath) !== null && _b !== void 0 ? _b : null : null;
                 return result;
             }
         }
@@ -4403,7 +4877,7 @@
         }
         toJSON() {
             const res = {
-                $mid: 1 /* Uri */
+                $mid: 1 /* MarshalledId.Uri */
             };
             // cached state
             if (this._fsPath) {
@@ -4413,10 +4887,14 @@
             if (this._formatted) {
                 res.external = this._formatted;
             }
-            // uri components
+            //--- uri components
             if (this.path) {
                 res.path = this.path;
             }
+            // TODO
+            // this isn't correct and can violate the UriComponents contract but
+            // this is part of the vscode.Uri API and we shouldn't change how that
+            // works anymore
             if (this.scheme) {
                 res.scheme = this.scheme;
             }
@@ -4434,40 +4912,43 @@
     }
     // reserved characters: https://tools.ietf.org/html/rfc3986#section-2.2
     const encodeTable = {
-        [58 /* Colon */]: '%3A',
-        [47 /* Slash */]: '%2F',
-        [63 /* QuestionMark */]: '%3F',
-        [35 /* Hash */]: '%23',
-        [91 /* OpenSquareBracket */]: '%5B',
-        [93 /* CloseSquareBracket */]: '%5D',
-        [64 /* AtSign */]: '%40',
-        [33 /* ExclamationMark */]: '%21',
-        [36 /* DollarSign */]: '%24',
-        [38 /* Ampersand */]: '%26',
-        [39 /* SingleQuote */]: '%27',
-        [40 /* OpenParen */]: '%28',
-        [41 /* CloseParen */]: '%29',
-        [42 /* Asterisk */]: '%2A',
-        [43 /* Plus */]: '%2B',
-        [44 /* Comma */]: '%2C',
-        [59 /* Semicolon */]: '%3B',
-        [61 /* Equals */]: '%3D',
-        [32 /* Space */]: '%20',
+        [58 /* CharCode.Colon */]: '%3A',
+        [47 /* CharCode.Slash */]: '%2F',
+        [63 /* CharCode.QuestionMark */]: '%3F',
+        [35 /* CharCode.Hash */]: '%23',
+        [91 /* CharCode.OpenSquareBracket */]: '%5B',
+        [93 /* CharCode.CloseSquareBracket */]: '%5D',
+        [64 /* CharCode.AtSign */]: '%40',
+        [33 /* CharCode.ExclamationMark */]: '%21',
+        [36 /* CharCode.DollarSign */]: '%24',
+        [38 /* CharCode.Ampersand */]: '%26',
+        [39 /* CharCode.SingleQuote */]: '%27',
+        [40 /* CharCode.OpenParen */]: '%28',
+        [41 /* CharCode.CloseParen */]: '%29',
+        [42 /* CharCode.Asterisk */]: '%2A',
+        [43 /* CharCode.Plus */]: '%2B',
+        [44 /* CharCode.Comma */]: '%2C',
+        [59 /* CharCode.Semicolon */]: '%3B',
+        [61 /* CharCode.Equals */]: '%3D',
+        [32 /* CharCode.Space */]: '%20',
     };
-    function encodeURIComponentFast(uriComponent, allowSlash) {
+    function encodeURIComponentFast(uriComponent, isPath, isAuthority) {
         let res = undefined;
         let nativeEncodePos = -1;
         for (let pos = 0; pos < uriComponent.length; pos++) {
             const code = uriComponent.charCodeAt(pos);
             // unreserved characters: https://tools.ietf.org/html/rfc3986#section-2.3
-            if ((code >= 97 /* a */ && code <= 122 /* z */)
-                || (code >= 65 /* A */ && code <= 90 /* Z */)
-                || (code >= 48 /* Digit0 */ && code <= 57 /* Digit9 */)
-                || code === 45 /* Dash */
-                || code === 46 /* Period */
-                || code === 95 /* Underline */
-                || code === 126 /* Tilde */
-                || (allowSlash && code === 47 /* Slash */)) {
+            if ((code >= 97 /* CharCode.a */ && code <= 122 /* CharCode.z */)
+                || (code >= 65 /* CharCode.A */ && code <= 90 /* CharCode.Z */)
+                || (code >= 48 /* CharCode.Digit0 */ && code <= 57 /* CharCode.Digit9 */)
+                || code === 45 /* CharCode.Dash */
+                || code === 46 /* CharCode.Period */
+                || code === 95 /* CharCode.Underline */
+                || code === 126 /* CharCode.Tilde */
+                || (isPath && code === 47 /* CharCode.Slash */)
+                || (isAuthority && code === 91 /* CharCode.OpenSquareBracket */)
+                || (isAuthority && code === 93 /* CharCode.CloseSquareBracket */)
+                || (isAuthority && code === 58 /* CharCode.Colon */)) {
                 // check if we are delaying native encode
                 if (nativeEncodePos !== -1) {
                     res += encodeURIComponent(uriComponent.substring(nativeEncodePos, pos));
@@ -4509,7 +4990,7 @@
         let res = undefined;
         for (let pos = 0; pos < path.length; pos++) {
             const code = path.charCodeAt(pos);
-            if (code === 35 /* Hash */ || code === 63 /* QuestionMark */) {
+            if (code === 35 /* CharCode.Hash */ || code === 63 /* CharCode.QuestionMark */) {
                 if (res === undefined) {
                     res = path.substr(0, pos);
                 }
@@ -4532,9 +5013,9 @@
             // unc path: file://shares/c$/far/boo
             value = `//${uri.authority}${uri.path}`;
         }
-        else if (uri.path.charCodeAt(0) === 47 /* Slash */
-            && (uri.path.charCodeAt(1) >= 65 /* A */ && uri.path.charCodeAt(1) <= 90 /* Z */ || uri.path.charCodeAt(1) >= 97 /* a */ && uri.path.charCodeAt(1) <= 122 /* z */)
-            && uri.path.charCodeAt(2) === 58 /* Colon */) {
+        else if (uri.path.charCodeAt(0) === 47 /* CharCode.Slash */
+            && (uri.path.charCodeAt(1) >= 65 /* CharCode.A */ && uri.path.charCodeAt(1) <= 90 /* CharCode.Z */ || uri.path.charCodeAt(1) >= 97 /* CharCode.a */ && uri.path.charCodeAt(1) <= 122 /* CharCode.z */)
+            && uri.path.charCodeAt(2) === 58 /* CharCode.Colon */) {
             if (!keepDriveLetterCasing) {
                 // windows drive letter: file:///c:/far/boo
                 value = uri.path[1].toLowerCase() + uri.path.substr(2);
@@ -4575,53 +5056,53 @@
                 // <user>@<auth>
                 const userinfo = authority.substr(0, idx);
                 authority = authority.substr(idx + 1);
-                idx = userinfo.indexOf(':');
+                idx = userinfo.lastIndexOf(':');
                 if (idx === -1) {
-                    res += encoder(userinfo, false);
+                    res += encoder(userinfo, false, false);
                 }
                 else {
                     // <user>:<pass>@<auth>
-                    res += encoder(userinfo.substr(0, idx), false);
+                    res += encoder(userinfo.substr(0, idx), false, false);
                     res += ':';
-                    res += encoder(userinfo.substr(idx + 1), false);
+                    res += encoder(userinfo.substr(idx + 1), false, true);
                 }
                 res += '@';
             }
             authority = authority.toLowerCase();
-            idx = authority.indexOf(':');
+            idx = authority.lastIndexOf(':');
             if (idx === -1) {
-                res += encoder(authority, false);
+                res += encoder(authority, false, true);
             }
             else {
                 // <auth>:<port>
-                res += encoder(authority.substr(0, idx), false);
+                res += encoder(authority.substr(0, idx), false, true);
                 res += authority.substr(idx);
             }
         }
         if (path) {
             // lower-case windows drive letters in /C:/fff or C:/fff
-            if (path.length >= 3 && path.charCodeAt(0) === 47 /* Slash */ && path.charCodeAt(2) === 58 /* Colon */) {
+            if (path.length >= 3 && path.charCodeAt(0) === 47 /* CharCode.Slash */ && path.charCodeAt(2) === 58 /* CharCode.Colon */) {
                 const code = path.charCodeAt(1);
-                if (code >= 65 /* A */ && code <= 90 /* Z */) {
+                if (code >= 65 /* CharCode.A */ && code <= 90 /* CharCode.Z */) {
                     path = `/${String.fromCharCode(code + 32)}:${path.substr(3)}`; // "/c:".length === 3
                 }
             }
-            else if (path.length >= 2 && path.charCodeAt(1) === 58 /* Colon */) {
+            else if (path.length >= 2 && path.charCodeAt(1) === 58 /* CharCode.Colon */) {
                 const code = path.charCodeAt(0);
-                if (code >= 65 /* A */ && code <= 90 /* Z */) {
+                if (code >= 65 /* CharCode.A */ && code <= 90 /* CharCode.Z */) {
                     path = `${String.fromCharCode(code + 32)}:${path.substr(2)}`; // "/c:".length === 3
                 }
             }
             // encode the rest of the path
-            res += encoder(path, true);
+            res += encoder(path, true, false);
         }
         if (query) {
             res += '?';
-            res += encoder(query, false);
+            res += encoder(query, false, false);
         }
         if (fragment) {
             res += '#';
-            res += !skipEncoding ? encodeURIComponentFast(fragment, false) : fragment;
+            res += !skipEncoding ? encodeURIComponentFast(fragment, false, false) : fragment;
         }
         return res;
     }
@@ -4957,10 +5438,10 @@
             let resultStartColumn = a.startColumn;
             let resultEndLineNumber = a.endLineNumber;
             let resultEndColumn = a.endColumn;
-            let otherStartLineNumber = b.startLineNumber;
-            let otherStartColumn = b.startColumn;
-            let otherEndLineNumber = b.endLineNumber;
-            let otherEndColumn = b.endColumn;
+            const otherStartLineNumber = b.startLineNumber;
+            const otherStartColumn = b.startColumn;
+            const otherEndLineNumber = b.endLineNumber;
+            const otherEndColumn = b.endColumn;
             if (resultStartLineNumber < otherStartLineNumber) {
                 resultStartLineNumber = otherStartLineNumber;
                 resultStartColumn = otherStartColumn;
@@ -4994,6 +5475,9 @@
          * Test if range `a` equals `b`.
          */
         static equalsRange(a, b) {
+            if (!a && !b) {
+                return true;
+            }
             return (!!a &&
                 !!b &&
                 a.startLineNumber === b.startLineNumber &&
@@ -5054,6 +5538,24 @@
          */
         static collapseToStart(range) {
             return new Range$1(range.startLineNumber, range.startColumn, range.startLineNumber, range.startColumn);
+        }
+        /**
+         * Create a new empty range using this range's end position.
+         */
+        collapseToEnd() {
+            return Range$1.collapseToEnd(this);
+        }
+        /**
+         * Create a new empty range using this range's end position.
+         */
+        static collapseToEnd(range) {
+            return new Range$1(range.endLineNumber, range.endColumn, range.endLineNumber, range.endColumn);
+        }
+        /**
+         * Moves the range by the given amount of lines.
+         */
+        delta(lineCount) {
+            return new Range$1(this.startLineNumber + lineCount, this.startColumn, this.endLineNumber + lineCount, this.endColumn);
         }
         // ---
         static fromPositions(start, end = start) {
@@ -5156,404 +5658,34 @@
         static spansMultipleLines(range) {
             return range.endLineNumber > range.startLineNumber;
         }
+        toJSON() {
+            return this;
+        }
     }
 
-    /*---------------------------------------------------------------------------------------------
-     *  Copyright (c) Microsoft Corporation. All rights reserved.
-     *  Licensed under the MIT License. See License.txt in the project root for license information.
-     *--------------------------------------------------------------------------------------------*/
-    const MINIMUM_MATCHING_CHARACTER_LENGTH = 3;
-    function computeDiff(originalSequence, modifiedSequence, continueProcessingPredicate, pretty) {
-        const diffAlgo = new LcsDiff(originalSequence, modifiedSequence, continueProcessingPredicate);
-        return diffAlgo.ComputeDiff(pretty);
-    }
-    class LineSequence {
-        constructor(lines) {
-            const startColumns = [];
-            const endColumns = [];
-            for (let i = 0, length = lines.length; i < length; i++) {
-                startColumns[i] = getFirstNonBlankColumn(lines[i], 1);
-                endColumns[i] = getLastNonBlankColumn(lines[i], 1);
-            }
-            this.lines = lines;
-            this._startColumns = startColumns;
-            this._endColumns = endColumns;
+    /**
+     * Returns the last element of an array.
+     * @param array The array.
+     * @param n Which element from the end (default is zero).
+     */
+    var CompareResult;
+    (function (CompareResult) {
+        function isLessThan(result) {
+            return result < 0;
         }
-        getElements() {
-            const elements = [];
-            for (let i = 0, len = this.lines.length; i < len; i++) {
-                elements[i] = this.lines[i].substring(this._startColumns[i] - 1, this._endColumns[i] - 1);
-            }
-            return elements;
+        CompareResult.isLessThan = isLessThan;
+        function isGreaterThan(result) {
+            return result > 0;
         }
-        getStrictElement(index) {
-            return this.lines[index];
+        CompareResult.isGreaterThan = isGreaterThan;
+        function isNeitherLessOrGreaterThan(result) {
+            return result === 0;
         }
-        getStartLineNumber(i) {
-            return i + 1;
-        }
-        getEndLineNumber(i) {
-            return i + 1;
-        }
-        createCharSequence(shouldIgnoreTrimWhitespace, startIndex, endIndex) {
-            const charCodes = [];
-            const lineNumbers = [];
-            const columns = [];
-            let len = 0;
-            for (let index = startIndex; index <= endIndex; index++) {
-                const lineContent = this.lines[index];
-                const startColumn = (shouldIgnoreTrimWhitespace ? this._startColumns[index] : 1);
-                const endColumn = (shouldIgnoreTrimWhitespace ? this._endColumns[index] : lineContent.length + 1);
-                for (let col = startColumn; col < endColumn; col++) {
-                    charCodes[len] = lineContent.charCodeAt(col - 1);
-                    lineNumbers[len] = index + 1;
-                    columns[len] = col;
-                    len++;
-                }
-            }
-            return new CharSequence(charCodes, lineNumbers, columns);
-        }
-    }
-    class CharSequence {
-        constructor(charCodes, lineNumbers, columns) {
-            this._charCodes = charCodes;
-            this._lineNumbers = lineNumbers;
-            this._columns = columns;
-        }
-        getElements() {
-            return this._charCodes;
-        }
-        getStartLineNumber(i) {
-            return this._lineNumbers[i];
-        }
-        getStartColumn(i) {
-            return this._columns[i];
-        }
-        getEndLineNumber(i) {
-            return this._lineNumbers[i];
-        }
-        getEndColumn(i) {
-            return this._columns[i] + 1;
-        }
-    }
-    class CharChange {
-        constructor(originalStartLineNumber, originalStartColumn, originalEndLineNumber, originalEndColumn, modifiedStartLineNumber, modifiedStartColumn, modifiedEndLineNumber, modifiedEndColumn) {
-            this.originalStartLineNumber = originalStartLineNumber;
-            this.originalStartColumn = originalStartColumn;
-            this.originalEndLineNumber = originalEndLineNumber;
-            this.originalEndColumn = originalEndColumn;
-            this.modifiedStartLineNumber = modifiedStartLineNumber;
-            this.modifiedStartColumn = modifiedStartColumn;
-            this.modifiedEndLineNumber = modifiedEndLineNumber;
-            this.modifiedEndColumn = modifiedEndColumn;
-        }
-        static createFromDiffChange(diffChange, originalCharSequence, modifiedCharSequence) {
-            let originalStartLineNumber;
-            let originalStartColumn;
-            let originalEndLineNumber;
-            let originalEndColumn;
-            let modifiedStartLineNumber;
-            let modifiedStartColumn;
-            let modifiedEndLineNumber;
-            let modifiedEndColumn;
-            if (diffChange.originalLength === 0) {
-                originalStartLineNumber = 0;
-                originalStartColumn = 0;
-                originalEndLineNumber = 0;
-                originalEndColumn = 0;
-            }
-            else {
-                originalStartLineNumber = originalCharSequence.getStartLineNumber(diffChange.originalStart);
-                originalStartColumn = originalCharSequence.getStartColumn(diffChange.originalStart);
-                originalEndLineNumber = originalCharSequence.getEndLineNumber(diffChange.originalStart + diffChange.originalLength - 1);
-                originalEndColumn = originalCharSequence.getEndColumn(diffChange.originalStart + diffChange.originalLength - 1);
-            }
-            if (diffChange.modifiedLength === 0) {
-                modifiedStartLineNumber = 0;
-                modifiedStartColumn = 0;
-                modifiedEndLineNumber = 0;
-                modifiedEndColumn = 0;
-            }
-            else {
-                modifiedStartLineNumber = modifiedCharSequence.getStartLineNumber(diffChange.modifiedStart);
-                modifiedStartColumn = modifiedCharSequence.getStartColumn(diffChange.modifiedStart);
-                modifiedEndLineNumber = modifiedCharSequence.getEndLineNumber(diffChange.modifiedStart + diffChange.modifiedLength - 1);
-                modifiedEndColumn = modifiedCharSequence.getEndColumn(diffChange.modifiedStart + diffChange.modifiedLength - 1);
-            }
-            return new CharChange(originalStartLineNumber, originalStartColumn, originalEndLineNumber, originalEndColumn, modifiedStartLineNumber, modifiedStartColumn, modifiedEndLineNumber, modifiedEndColumn);
-        }
-    }
-    function postProcessCharChanges(rawChanges) {
-        if (rawChanges.length <= 1) {
-            return rawChanges;
-        }
-        const result = [rawChanges[0]];
-        let prevChange = result[0];
-        for (let i = 1, len = rawChanges.length; i < len; i++) {
-            const currChange = rawChanges[i];
-            const originalMatchingLength = currChange.originalStart - (prevChange.originalStart + prevChange.originalLength);
-            const modifiedMatchingLength = currChange.modifiedStart - (prevChange.modifiedStart + prevChange.modifiedLength);
-            // Both of the above should be equal, but the continueProcessingPredicate may prevent this from being true
-            const matchingLength = Math.min(originalMatchingLength, modifiedMatchingLength);
-            if (matchingLength < MINIMUM_MATCHING_CHARACTER_LENGTH) {
-                // Merge the current change into the previous one
-                prevChange.originalLength = (currChange.originalStart + currChange.originalLength) - prevChange.originalStart;
-                prevChange.modifiedLength = (currChange.modifiedStart + currChange.modifiedLength) - prevChange.modifiedStart;
-            }
-            else {
-                // Add the current change
-                result.push(currChange);
-                prevChange = currChange;
-            }
-        }
-        return result;
-    }
-    class LineChange {
-        constructor(originalStartLineNumber, originalEndLineNumber, modifiedStartLineNumber, modifiedEndLineNumber, charChanges) {
-            this.originalStartLineNumber = originalStartLineNumber;
-            this.originalEndLineNumber = originalEndLineNumber;
-            this.modifiedStartLineNumber = modifiedStartLineNumber;
-            this.modifiedEndLineNumber = modifiedEndLineNumber;
-            this.charChanges = charChanges;
-        }
-        static createFromDiffResult(shouldIgnoreTrimWhitespace, diffChange, originalLineSequence, modifiedLineSequence, continueCharDiff, shouldComputeCharChanges, shouldPostProcessCharChanges) {
-            let originalStartLineNumber;
-            let originalEndLineNumber;
-            let modifiedStartLineNumber;
-            let modifiedEndLineNumber;
-            let charChanges = undefined;
-            if (diffChange.originalLength === 0) {
-                originalStartLineNumber = originalLineSequence.getStartLineNumber(diffChange.originalStart) - 1;
-                originalEndLineNumber = 0;
-            }
-            else {
-                originalStartLineNumber = originalLineSequence.getStartLineNumber(diffChange.originalStart);
-                originalEndLineNumber = originalLineSequence.getEndLineNumber(diffChange.originalStart + diffChange.originalLength - 1);
-            }
-            if (diffChange.modifiedLength === 0) {
-                modifiedStartLineNumber = modifiedLineSequence.getStartLineNumber(diffChange.modifiedStart) - 1;
-                modifiedEndLineNumber = 0;
-            }
-            else {
-                modifiedStartLineNumber = modifiedLineSequence.getStartLineNumber(diffChange.modifiedStart);
-                modifiedEndLineNumber = modifiedLineSequence.getEndLineNumber(diffChange.modifiedStart + diffChange.modifiedLength - 1);
-            }
-            if (shouldComputeCharChanges && diffChange.originalLength > 0 && diffChange.originalLength < 20 && diffChange.modifiedLength > 0 && diffChange.modifiedLength < 20 && continueCharDiff()) {
-                // Compute character changes for diff chunks of at most 20 lines...
-                const originalCharSequence = originalLineSequence.createCharSequence(shouldIgnoreTrimWhitespace, diffChange.originalStart, diffChange.originalStart + diffChange.originalLength - 1);
-                const modifiedCharSequence = modifiedLineSequence.createCharSequence(shouldIgnoreTrimWhitespace, diffChange.modifiedStart, diffChange.modifiedStart + diffChange.modifiedLength - 1);
-                let rawChanges = computeDiff(originalCharSequence, modifiedCharSequence, continueCharDiff, true).changes;
-                if (shouldPostProcessCharChanges) {
-                    rawChanges = postProcessCharChanges(rawChanges);
-                }
-                charChanges = [];
-                for (let i = 0, length = rawChanges.length; i < length; i++) {
-                    charChanges.push(CharChange.createFromDiffChange(rawChanges[i], originalCharSequence, modifiedCharSequence));
-                }
-            }
-            return new LineChange(originalStartLineNumber, originalEndLineNumber, modifiedStartLineNumber, modifiedEndLineNumber, charChanges);
-        }
-    }
-    class DiffComputer {
-        constructor(originalLines, modifiedLines, opts) {
-            this.shouldComputeCharChanges = opts.shouldComputeCharChanges;
-            this.shouldPostProcessCharChanges = opts.shouldPostProcessCharChanges;
-            this.shouldIgnoreTrimWhitespace = opts.shouldIgnoreTrimWhitespace;
-            this.shouldMakePrettyDiff = opts.shouldMakePrettyDiff;
-            this.originalLines = originalLines;
-            this.modifiedLines = modifiedLines;
-            this.original = new LineSequence(originalLines);
-            this.modified = new LineSequence(modifiedLines);
-            this.continueLineDiff = createContinueProcessingPredicate(opts.maxComputationTime);
-            this.continueCharDiff = createContinueProcessingPredicate(opts.maxComputationTime === 0 ? 0 : Math.min(opts.maxComputationTime, 5000)); // never run after 5s for character changes...
-        }
-        computeDiff() {
-            if (this.original.lines.length === 1 && this.original.lines[0].length === 0) {
-                // empty original => fast path
-                if (this.modified.lines.length === 1 && this.modified.lines[0].length === 0) {
-                    return {
-                        quitEarly: false,
-                        changes: []
-                    };
-                }
-                return {
-                    quitEarly: false,
-                    changes: [{
-                            originalStartLineNumber: 1,
-                            originalEndLineNumber: 1,
-                            modifiedStartLineNumber: 1,
-                            modifiedEndLineNumber: this.modified.lines.length,
-                            charChanges: [{
-                                    modifiedEndColumn: 0,
-                                    modifiedEndLineNumber: 0,
-                                    modifiedStartColumn: 0,
-                                    modifiedStartLineNumber: 0,
-                                    originalEndColumn: 0,
-                                    originalEndLineNumber: 0,
-                                    originalStartColumn: 0,
-                                    originalStartLineNumber: 0
-                                }]
-                        }]
-                };
-            }
-            if (this.modified.lines.length === 1 && this.modified.lines[0].length === 0) {
-                // empty modified => fast path
-                return {
-                    quitEarly: false,
-                    changes: [{
-                            originalStartLineNumber: 1,
-                            originalEndLineNumber: this.original.lines.length,
-                            modifiedStartLineNumber: 1,
-                            modifiedEndLineNumber: 1,
-                            charChanges: [{
-                                    modifiedEndColumn: 0,
-                                    modifiedEndLineNumber: 0,
-                                    modifiedStartColumn: 0,
-                                    modifiedStartLineNumber: 0,
-                                    originalEndColumn: 0,
-                                    originalEndLineNumber: 0,
-                                    originalStartColumn: 0,
-                                    originalStartLineNumber: 0
-                                }]
-                        }]
-                };
-            }
-            const diffResult = computeDiff(this.original, this.modified, this.continueLineDiff, this.shouldMakePrettyDiff);
-            const rawChanges = diffResult.changes;
-            const quitEarly = diffResult.quitEarly;
-            // The diff is always computed with ignoring trim whitespace
-            // This ensures we get the prettiest diff
-            if (this.shouldIgnoreTrimWhitespace) {
-                const lineChanges = [];
-                for (let i = 0, length = rawChanges.length; i < length; i++) {
-                    lineChanges.push(LineChange.createFromDiffResult(this.shouldIgnoreTrimWhitespace, rawChanges[i], this.original, this.modified, this.continueCharDiff, this.shouldComputeCharChanges, this.shouldPostProcessCharChanges));
-                }
-                return {
-                    quitEarly: quitEarly,
-                    changes: lineChanges
-                };
-            }
-            // Need to post-process and introduce changes where the trim whitespace is different
-            // Note that we are looping starting at -1 to also cover the lines before the first change
-            const result = [];
-            let originalLineIndex = 0;
-            let modifiedLineIndex = 0;
-            for (let i = -1 /* !!!! */, len = rawChanges.length; i < len; i++) {
-                const nextChange = (i + 1 < len ? rawChanges[i + 1] : null);
-                const originalStop = (nextChange ? nextChange.originalStart : this.originalLines.length);
-                const modifiedStop = (nextChange ? nextChange.modifiedStart : this.modifiedLines.length);
-                while (originalLineIndex < originalStop && modifiedLineIndex < modifiedStop) {
-                    const originalLine = this.originalLines[originalLineIndex];
-                    const modifiedLine = this.modifiedLines[modifiedLineIndex];
-                    if (originalLine !== modifiedLine) {
-                        // These lines differ only in trim whitespace
-                        // Check the leading whitespace
-                        {
-                            let originalStartColumn = getFirstNonBlankColumn(originalLine, 1);
-                            let modifiedStartColumn = getFirstNonBlankColumn(modifiedLine, 1);
-                            while (originalStartColumn > 1 && modifiedStartColumn > 1) {
-                                const originalChar = originalLine.charCodeAt(originalStartColumn - 2);
-                                const modifiedChar = modifiedLine.charCodeAt(modifiedStartColumn - 2);
-                                if (originalChar !== modifiedChar) {
-                                    break;
-                                }
-                                originalStartColumn--;
-                                modifiedStartColumn--;
-                            }
-                            if (originalStartColumn > 1 || modifiedStartColumn > 1) {
-                                this._pushTrimWhitespaceCharChange(result, originalLineIndex + 1, 1, originalStartColumn, modifiedLineIndex + 1, 1, modifiedStartColumn);
-                            }
-                        }
-                        // Check the trailing whitespace
-                        {
-                            let originalEndColumn = getLastNonBlankColumn(originalLine, 1);
-                            let modifiedEndColumn = getLastNonBlankColumn(modifiedLine, 1);
-                            const originalMaxColumn = originalLine.length + 1;
-                            const modifiedMaxColumn = modifiedLine.length + 1;
-                            while (originalEndColumn < originalMaxColumn && modifiedEndColumn < modifiedMaxColumn) {
-                                const originalChar = originalLine.charCodeAt(originalEndColumn - 1);
-                                const modifiedChar = originalLine.charCodeAt(modifiedEndColumn - 1);
-                                if (originalChar !== modifiedChar) {
-                                    break;
-                                }
-                                originalEndColumn++;
-                                modifiedEndColumn++;
-                            }
-                            if (originalEndColumn < originalMaxColumn || modifiedEndColumn < modifiedMaxColumn) {
-                                this._pushTrimWhitespaceCharChange(result, originalLineIndex + 1, originalEndColumn, originalMaxColumn, modifiedLineIndex + 1, modifiedEndColumn, modifiedMaxColumn);
-                            }
-                        }
-                    }
-                    originalLineIndex++;
-                    modifiedLineIndex++;
-                }
-                if (nextChange) {
-                    // Emit the actual change
-                    result.push(LineChange.createFromDiffResult(this.shouldIgnoreTrimWhitespace, nextChange, this.original, this.modified, this.continueCharDiff, this.shouldComputeCharChanges, this.shouldPostProcessCharChanges));
-                    originalLineIndex += nextChange.originalLength;
-                    modifiedLineIndex += nextChange.modifiedLength;
-                }
-            }
-            return {
-                quitEarly: quitEarly,
-                changes: result
-            };
-        }
-        _pushTrimWhitespaceCharChange(result, originalLineNumber, originalStartColumn, originalEndColumn, modifiedLineNumber, modifiedStartColumn, modifiedEndColumn) {
-            if (this._mergeTrimWhitespaceCharChange(result, originalLineNumber, originalStartColumn, originalEndColumn, modifiedLineNumber, modifiedStartColumn, modifiedEndColumn)) {
-                // Merged into previous
-                return;
-            }
-            let charChanges = undefined;
-            if (this.shouldComputeCharChanges) {
-                charChanges = [new CharChange(originalLineNumber, originalStartColumn, originalLineNumber, originalEndColumn, modifiedLineNumber, modifiedStartColumn, modifiedLineNumber, modifiedEndColumn)];
-            }
-            result.push(new LineChange(originalLineNumber, originalLineNumber, modifiedLineNumber, modifiedLineNumber, charChanges));
-        }
-        _mergeTrimWhitespaceCharChange(result, originalLineNumber, originalStartColumn, originalEndColumn, modifiedLineNumber, modifiedStartColumn, modifiedEndColumn) {
-            const len = result.length;
-            if (len === 0) {
-                return false;
-            }
-            const prevChange = result[len - 1];
-            if (prevChange.originalEndLineNumber === 0 || prevChange.modifiedEndLineNumber === 0) {
-                // Don't merge with inserts/deletes
-                return false;
-            }
-            if (prevChange.originalEndLineNumber + 1 === originalLineNumber && prevChange.modifiedEndLineNumber + 1 === modifiedLineNumber) {
-                prevChange.originalEndLineNumber = originalLineNumber;
-                prevChange.modifiedEndLineNumber = modifiedLineNumber;
-                if (this.shouldComputeCharChanges && prevChange.charChanges) {
-                    prevChange.charChanges.push(new CharChange(originalLineNumber, originalStartColumn, originalLineNumber, originalEndColumn, modifiedLineNumber, modifiedStartColumn, modifiedLineNumber, modifiedEndColumn));
-                }
-                return true;
-            }
-            return false;
-        }
-    }
-    function getFirstNonBlankColumn(txt, defaultValue) {
-        const r = firstNonWhitespaceIndex(txt);
-        if (r === -1) {
-            return defaultValue;
-        }
-        return r + 1;
-    }
-    function getLastNonBlankColumn(txt, defaultValue) {
-        const r = lastNonWhitespaceIndex(txt);
-        if (r === -1) {
-            return defaultValue;
-        }
-        return r + 2;
-    }
-    function createContinueProcessingPredicate(maximumRuntime) {
-        if (maximumRuntime === 0) {
-            return () => true;
-        }
-        const startTime = Date.now();
-        return () => {
-            return Date.now() - startTime < maximumRuntime;
-        };
-    }
+        CompareResult.isNeitherLessOrGreaterThan = isNeitherLessOrGreaterThan;
+        CompareResult.greaterThan = 1;
+        CompareResult.lessThan = -1;
+        CompareResult.neitherLessOrGreaterThan = 0;
+    })(CompareResult || (CompareResult = {}));
 
     /*---------------------------------------------------------------------------------------------
      *  Copyright (c) Microsoft Corporation. All rights reserved.
@@ -5563,8 +5695,8 @@
         if (v < 0) {
             return 0;
         }
-        if (v > 255 /* MAX_UINT_8 */) {
-            return 255 /* MAX_UINT_8 */;
+        if (v > 255 /* Constants.MAX_UINT_8 */) {
+            return 255 /* Constants.MAX_UINT_8 */;
         }
         return v | 0;
     }
@@ -5572,8 +5704,8 @@
         if (v < 0) {
             return 0;
         }
-        if (v > 4294967295 /* MAX_UINT_32 */) {
-            return 4294967295 /* MAX_UINT_32 */;
+        if (v > 4294967295 /* Constants.MAX_UINT_32 */) {
+            return 4294967295 /* Constants.MAX_UINT_32 */;
         }
         return v | 0;
     }
@@ -5880,12 +6012,16 @@
         result.lastIndex = 0;
         return result;
     }
-    const _defaultConfig = {
+    const _defaultConfig = new LinkedList();
+    _defaultConfig.unshift({
         maxLen: 1000,
         windowSize: 15,
         timeBudget: 150
-    };
-    function getWordAtText(column, wordDefinition, text, textOffset, config = _defaultConfig) {
+    });
+    function getWordAtText(column, wordDefinition, text, textOffset, config) {
+        if (!config) {
+            config = Iterable.first(_defaultConfig);
+        }
         if (text.length > config.maxLen) {
             // don't throw strings that long at the regexp
             // but use a sub-string in which a word must occur
@@ -5965,9 +6101,7 @@
         }
         static _createAsciiMap(defaultValue) {
             const asciiMap = new Uint8Array(256);
-            for (let i = 0; i < 256; i++) {
-                asciiMap[i] = defaultValue;
-            }
+            asciiMap.fill(defaultValue);
             return asciiMap;
         }
         set(charCode, _value) {
@@ -5986,6 +6120,10 @@
             else {
                 return (this._map.get(charCode) || this._defaultValue);
             }
+        }
+        clear() {
+            this._asciiMap.fill(this._defaultValue);
+            this._map.clear();
         }
     }
 
@@ -6013,7 +6151,7 @@
     class StateMachine {
         constructor(edges) {
             let maxCharCode = 0;
-            let maxState = 0 /* Invalid */;
+            let maxState = 0 /* State.Invalid */;
             for (let i = 0, len = edges.length; i < len; i++) {
                 const [from, chCode, to] = edges[i];
                 if (chCode > maxCharCode) {
@@ -6028,7 +6166,7 @@
             }
             maxCharCode++;
             maxState++;
-            const states = new Uint8Matrix(maxState, maxCharCode, 0 /* Invalid */);
+            const states = new Uint8Matrix(maxState, maxCharCode, 0 /* State.Invalid */);
             for (let i = 0, len = edges.length; i < len; i++) {
                 const [from, chCode, to] = edges[i];
                 states.set(from, chCode, to);
@@ -6038,7 +6176,7 @@
         }
         nextState(currentState, chCode) {
             if (chCode < 0 || chCode >= this._maxCharCode) {
-                return 0 /* Invalid */;
+                return 0 /* State.Invalid */;
             }
             return this._states.get(currentState, chCode);
         }
@@ -6048,28 +6186,28 @@
     function getStateMachine() {
         if (_stateMachine === null) {
             _stateMachine = new StateMachine([
-                [1 /* Start */, 104 /* h */, 2 /* H */],
-                [1 /* Start */, 72 /* H */, 2 /* H */],
-                [1 /* Start */, 102 /* f */, 6 /* F */],
-                [1 /* Start */, 70 /* F */, 6 /* F */],
-                [2 /* H */, 116 /* t */, 3 /* HT */],
-                [2 /* H */, 84 /* T */, 3 /* HT */],
-                [3 /* HT */, 116 /* t */, 4 /* HTT */],
-                [3 /* HT */, 84 /* T */, 4 /* HTT */],
-                [4 /* HTT */, 112 /* p */, 5 /* HTTP */],
-                [4 /* HTT */, 80 /* P */, 5 /* HTTP */],
-                [5 /* HTTP */, 115 /* s */, 9 /* BeforeColon */],
-                [5 /* HTTP */, 83 /* S */, 9 /* BeforeColon */],
-                [5 /* HTTP */, 58 /* Colon */, 10 /* AfterColon */],
-                [6 /* F */, 105 /* i */, 7 /* FI */],
-                [6 /* F */, 73 /* I */, 7 /* FI */],
-                [7 /* FI */, 108 /* l */, 8 /* FIL */],
-                [7 /* FI */, 76 /* L */, 8 /* FIL */],
-                [8 /* FIL */, 101 /* e */, 9 /* BeforeColon */],
-                [8 /* FIL */, 69 /* E */, 9 /* BeforeColon */],
-                [9 /* BeforeColon */, 58 /* Colon */, 10 /* AfterColon */],
-                [10 /* AfterColon */, 47 /* Slash */, 11 /* AlmostThere */],
-                [11 /* AlmostThere */, 47 /* Slash */, 12 /* End */],
+                [1 /* State.Start */, 104 /* CharCode.h */, 2 /* State.H */],
+                [1 /* State.Start */, 72 /* CharCode.H */, 2 /* State.H */],
+                [1 /* State.Start */, 102 /* CharCode.f */, 6 /* State.F */],
+                [1 /* State.Start */, 70 /* CharCode.F */, 6 /* State.F */],
+                [2 /* State.H */, 116 /* CharCode.t */, 3 /* State.HT */],
+                [2 /* State.H */, 84 /* CharCode.T */, 3 /* State.HT */],
+                [3 /* State.HT */, 116 /* CharCode.t */, 4 /* State.HTT */],
+                [3 /* State.HT */, 84 /* CharCode.T */, 4 /* State.HTT */],
+                [4 /* State.HTT */, 112 /* CharCode.p */, 5 /* State.HTTP */],
+                [4 /* State.HTT */, 80 /* CharCode.P */, 5 /* State.HTTP */],
+                [5 /* State.HTTP */, 115 /* CharCode.s */, 9 /* State.BeforeColon */],
+                [5 /* State.HTTP */, 83 /* CharCode.S */, 9 /* State.BeforeColon */],
+                [5 /* State.HTTP */, 58 /* CharCode.Colon */, 10 /* State.AfterColon */],
+                [6 /* State.F */, 105 /* CharCode.i */, 7 /* State.FI */],
+                [6 /* State.F */, 73 /* CharCode.I */, 7 /* State.FI */],
+                [7 /* State.FI */, 108 /* CharCode.l */, 8 /* State.FIL */],
+                [7 /* State.FI */, 76 /* CharCode.L */, 8 /* State.FIL */],
+                [8 /* State.FIL */, 101 /* CharCode.e */, 9 /* State.BeforeColon */],
+                [8 /* State.FIL */, 69 /* CharCode.E */, 9 /* State.BeforeColon */],
+                [9 /* State.BeforeColon */, 58 /* CharCode.Colon */, 10 /* State.AfterColon */],
+                [10 /* State.AfterColon */, 47 /* CharCode.Slash */, 11 /* State.AlmostThere */],
+                [11 /* State.AlmostThere */, 47 /* CharCode.Slash */, 12 /* State.End */],
             ]);
         }
         return _stateMachine;
@@ -6077,15 +6215,15 @@
     let _classifier = null;
     function getClassifier() {
         if (_classifier === null) {
-            _classifier = new CharacterClassifier(0 /* None */);
+            _classifier = new CharacterClassifier(0 /* CharacterClass.None */);
             // allow-any-unicode-next-line
             const FORCE_TERMINATION_CHARACTERS = ' \t<>\'\"、。｡､，．：；‘〈「『〔（［｛｢｣｝］）〕』」〉’｀～…';
             for (let i = 0; i < FORCE_TERMINATION_CHARACTERS.length; i++) {
-                _classifier.set(FORCE_TERMINATION_CHARACTERS.charCodeAt(i), 1 /* ForceTermination */);
+                _classifier.set(FORCE_TERMINATION_CHARACTERS.charCodeAt(i), 1 /* CharacterClass.ForceTermination */);
             }
-            const CANNOT_END_WITH_CHARACTERS = '.,;';
+            const CANNOT_END_WITH_CHARACTERS = '.,;:';
             for (let i = 0; i < CANNOT_END_WITH_CHARACTERS.length; i++) {
-                _classifier.set(CANNOT_END_WITH_CHARACTERS.charCodeAt(i), 2 /* CannotEndIn */);
+                _classifier.set(CANNOT_END_WITH_CHARACTERS.charCodeAt(i), 2 /* CharacterClass.CannotEndIn */);
             }
         }
         return _classifier;
@@ -6097,7 +6235,7 @@
             do {
                 const chCode = line.charCodeAt(lastIncludedCharIndex);
                 const chClass = classifier.get(chCode);
-                if (chClass !== 2 /* CannotEndIn */) {
+                if (chClass !== 2 /* CharacterClass.CannotEndIn */) {
                     break;
                 }
                 lastIncludedCharIndex--;
@@ -6106,9 +6244,9 @@
             if (linkBeginIndex > 0) {
                 const charCodeBeforeLink = line.charCodeAt(linkBeginIndex - 1);
                 const lastCharCodeInLink = line.charCodeAt(lastIncludedCharIndex);
-                if ((charCodeBeforeLink === 40 /* OpenParen */ && lastCharCodeInLink === 41 /* CloseParen */)
-                    || (charCodeBeforeLink === 91 /* OpenSquareBracket */ && lastCharCodeInLink === 93 /* CloseSquareBracket */)
-                    || (charCodeBeforeLink === 123 /* OpenCurlyBrace */ && lastCharCodeInLink === 125 /* CloseCurlyBrace */)) {
+                if ((charCodeBeforeLink === 40 /* CharCode.OpenParen */ && lastCharCodeInLink === 41 /* CharCode.CloseParen */)
+                    || (charCodeBeforeLink === 91 /* CharCode.OpenSquareBracket */ && lastCharCodeInLink === 93 /* CharCode.CloseSquareBracket */)
+                    || (charCodeBeforeLink === 123 /* CharCode.OpenCurlyBrace */ && lastCharCodeInLink === 125 /* CharCode.CloseCurlyBrace */)) {
                     // Do not end in ) if ( is before the link start
                     // Do not end in ] if [ is before the link start
                     // Do not end in } if { is before the link start
@@ -6134,7 +6272,7 @@
                 let j = 0;
                 let linkBeginIndex = 0;
                 let linkBeginChCode = 0;
-                let state = 1 /* Start */;
+                let state = 1 /* State.Start */;
                 let hasOpenParens = false;
                 let hasOpenSquareBracket = false;
                 let inSquareBrackets = false;
@@ -6142,89 +6280,94 @@
                 while (j < len) {
                     let resetStateMachine = false;
                     const chCode = line.charCodeAt(j);
-                    if (state === 13 /* Accept */) {
+                    if (state === 13 /* State.Accept */) {
                         let chClass;
                         switch (chCode) {
-                            case 40 /* OpenParen */:
+                            case 40 /* CharCode.OpenParen */:
                                 hasOpenParens = true;
-                                chClass = 0 /* None */;
+                                chClass = 0 /* CharacterClass.None */;
                                 break;
-                            case 41 /* CloseParen */:
-                                chClass = (hasOpenParens ? 0 /* None */ : 1 /* ForceTermination */);
+                            case 41 /* CharCode.CloseParen */:
+                                chClass = (hasOpenParens ? 0 /* CharacterClass.None */ : 1 /* CharacterClass.ForceTermination */);
                                 break;
-                            case 91 /* OpenSquareBracket */:
+                            case 91 /* CharCode.OpenSquareBracket */:
                                 inSquareBrackets = true;
                                 hasOpenSquareBracket = true;
-                                chClass = 0 /* None */;
+                                chClass = 0 /* CharacterClass.None */;
                                 break;
-                            case 93 /* CloseSquareBracket */:
+                            case 93 /* CharCode.CloseSquareBracket */:
                                 inSquareBrackets = false;
-                                chClass = (hasOpenSquareBracket ? 0 /* None */ : 1 /* ForceTermination */);
+                                chClass = (hasOpenSquareBracket ? 0 /* CharacterClass.None */ : 1 /* CharacterClass.ForceTermination */);
                                 break;
-                            case 123 /* OpenCurlyBrace */:
+                            case 123 /* CharCode.OpenCurlyBrace */:
                                 hasOpenCurlyBracket = true;
-                                chClass = 0 /* None */;
+                                chClass = 0 /* CharacterClass.None */;
                                 break;
-                            case 125 /* CloseCurlyBrace */:
-                                chClass = (hasOpenCurlyBracket ? 0 /* None */ : 1 /* ForceTermination */);
+                            case 125 /* CharCode.CloseCurlyBrace */:
+                                chClass = (hasOpenCurlyBracket ? 0 /* CharacterClass.None */ : 1 /* CharacterClass.ForceTermination */);
                                 break;
-                            /* The following three rules make it that ' or " or ` are allowed inside links if the link began with a different one */
-                            case 39 /* SingleQuote */:
-                                chClass = (linkBeginChCode === 34 /* DoubleQuote */ || linkBeginChCode === 96 /* BackTick */) ? 0 /* None */ : 1 /* ForceTermination */;
+                            // The following three rules make it that ' or " or ` are allowed inside links
+                            // only if the link is wrapped by some other quote character
+                            case 39 /* CharCode.SingleQuote */:
+                            case 34 /* CharCode.DoubleQuote */:
+                            case 96 /* CharCode.BackTick */:
+                                if (linkBeginChCode === chCode) {
+                                    chClass = 1 /* CharacterClass.ForceTermination */;
+                                }
+                                else if (linkBeginChCode === 39 /* CharCode.SingleQuote */ || linkBeginChCode === 34 /* CharCode.DoubleQuote */ || linkBeginChCode === 96 /* CharCode.BackTick */) {
+                                    chClass = 0 /* CharacterClass.None */;
+                                }
+                                else {
+                                    chClass = 1 /* CharacterClass.ForceTermination */;
+                                }
                                 break;
-                            case 34 /* DoubleQuote */:
-                                chClass = (linkBeginChCode === 39 /* SingleQuote */ || linkBeginChCode === 96 /* BackTick */) ? 0 /* None */ : 1 /* ForceTermination */;
-                                break;
-                            case 96 /* BackTick */:
-                                chClass = (linkBeginChCode === 39 /* SingleQuote */ || linkBeginChCode === 34 /* DoubleQuote */) ? 0 /* None */ : 1 /* ForceTermination */;
-                                break;
-                            case 42 /* Asterisk */:
+                            case 42 /* CharCode.Asterisk */:
                                 // `*` terminates a link if the link began with `*`
-                                chClass = (linkBeginChCode === 42 /* Asterisk */) ? 1 /* ForceTermination */ : 0 /* None */;
+                                chClass = (linkBeginChCode === 42 /* CharCode.Asterisk */) ? 1 /* CharacterClass.ForceTermination */ : 0 /* CharacterClass.None */;
                                 break;
-                            case 124 /* Pipe */:
+                            case 124 /* CharCode.Pipe */:
                                 // `|` terminates a link if the link began with `|`
-                                chClass = (linkBeginChCode === 124 /* Pipe */) ? 1 /* ForceTermination */ : 0 /* None */;
+                                chClass = (linkBeginChCode === 124 /* CharCode.Pipe */) ? 1 /* CharacterClass.ForceTermination */ : 0 /* CharacterClass.None */;
                                 break;
-                            case 32 /* Space */:
+                            case 32 /* CharCode.Space */:
                                 // ` ` allow space in between [ and ]
-                                chClass = (inSquareBrackets ? 0 /* None */ : 1 /* ForceTermination */);
+                                chClass = (inSquareBrackets ? 0 /* CharacterClass.None */ : 1 /* CharacterClass.ForceTermination */);
                                 break;
                             default:
                                 chClass = classifier.get(chCode);
                         }
                         // Check if character terminates link
-                        if (chClass === 1 /* ForceTermination */) {
+                        if (chClass === 1 /* CharacterClass.ForceTermination */) {
                             result.push(LinkComputer._createLink(classifier, line, i, linkBeginIndex, j));
                             resetStateMachine = true;
                         }
                     }
-                    else if (state === 12 /* End */) {
+                    else if (state === 12 /* State.End */) {
                         let chClass;
-                        if (chCode === 91 /* OpenSquareBracket */) {
+                        if (chCode === 91 /* CharCode.OpenSquareBracket */) {
                             // Allow for the authority part to contain ipv6 addresses which contain [ and ]
                             hasOpenSquareBracket = true;
-                            chClass = 0 /* None */;
+                            chClass = 0 /* CharacterClass.None */;
                         }
                         else {
                             chClass = classifier.get(chCode);
                         }
                         // Check if character terminates link
-                        if (chClass === 1 /* ForceTermination */) {
+                        if (chClass === 1 /* CharacterClass.ForceTermination */) {
                             resetStateMachine = true;
                         }
                         else {
-                            state = 13 /* Accept */;
+                            state = 13 /* State.Accept */;
                         }
                     }
                     else {
                         state = stateMachine.nextState(state, chCode);
-                        if (state === 0 /* Invalid */) {
+                        if (state === 0 /* State.Invalid */) {
                             resetStateMachine = true;
                         }
                     }
                     if (resetStateMachine) {
-                        state = 1 /* Start */;
+                        state = 1 /* State.Start */;
                         hasOpenParens = false;
                         hasOpenSquareBracket = false;
                         hasOpenCurlyBracket = false;
@@ -6234,7 +6377,7 @@
                     }
                     j++;
                 }
-                if (state === 13 /* Accept */) {
+                if (state === 13 /* State.Accept */) {
                     result.push(LinkComputer._createLink(classifier, line, i, linkBeginIndex, len));
                 }
             }
@@ -6298,7 +6441,7 @@
         numberReplace(value, up) {
             const precision = Math.pow(10, value.length - (value.lastIndexOf('.') + 1));
             let n1 = Number(value);
-            let n2 = parseFloat(value);
+            const n2 = parseFloat(value);
             if (!isNaN(n1) && !isNaN(n2) && n1 === n2) {
                 if (n1 === 0 && !up) {
                     return null; // don't do negative
@@ -6433,12 +6576,11 @@
             }
         }
         dispose(cancel = false) {
+            var _a;
             if (cancel) {
                 this.cancel();
             }
-            if (this._parentListener) {
-                this._parentListener.dispose();
-            }
+            (_a = this._parentListener) === null || _a === void 0 ? void 0 : _a.dispose();
             if (!this._token) {
                 // ensure to initialize with an empty token if we had none
                 this._token = CancellationToken.None;
@@ -6467,290 +6609,261 @@
             return this._keyCodeToStr[keyCode];
         }
         strToKeyCode(str) {
-            return this._strToKeyCode[str.toLowerCase()] || 0 /* Unknown */;
+            return this._strToKeyCode[str.toLowerCase()] || 0 /* KeyCode.Unknown */;
         }
     }
     const uiMap = new KeyCodeStrMap();
     const userSettingsUSMap = new KeyCodeStrMap();
     const userSettingsGeneralMap = new KeyCodeStrMap();
     const EVENT_KEY_CODE_MAP = new Array(230);
-    const NATIVE_WINDOWS_KEY_CODE_TO_KEY_CODE = {};
-    const scanCodeIntToStr = [];
     const scanCodeStrToInt = Object.create(null);
     const scanCodeLowerCaseStrToInt = Object.create(null);
-    /**
-     * -1 if a ScanCode => KeyCode mapping depends on kb layout.
-     */
-    const IMMUTABLE_CODE_TO_KEY_CODE = [];
-    /**
-     * -1 if a KeyCode => ScanCode mapping depends on kb layout.
-     */
-    const IMMUTABLE_KEY_CODE_TO_CODE = [];
-    for (let i = 0; i <= 193 /* MAX_VALUE */; i++) {
-        IMMUTABLE_CODE_TO_KEY_CODE[i] = -1 /* DependsOnKbLayout */;
-    }
-    for (let i = 0; i <= 126 /* MAX_VALUE */; i++) {
-        IMMUTABLE_KEY_CODE_TO_CODE[i] = -1 /* DependsOnKbLayout */;
-    }
     (function () {
         // See https://msdn.microsoft.com/en-us/library/windows/desktop/dd375731(v=vs.85).aspx
-        // See https://github.com/microsoft/node-native-keymap/blob/master/deps/chromium/keyboard_codes_win.h
+        // See https://github.com/microsoft/node-native-keymap/blob/88c0b0e5/deps/chromium/keyboard_codes_win.h
         const empty = '';
         const mappings = [
-            // keyCodeOrd, immutable, scanCode, scanCodeStr, keyCode, keyCodeStr, eventKeyCode, vkey, usUserSettingsLabel, generalUserSettingsLabel
-            [0, 1, 0 /* None */, 'None', 0 /* Unknown */, 'unknown', 0, 'VK_UNKNOWN', empty, empty],
-            [0, 1, 1 /* Hyper */, 'Hyper', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 2 /* Super */, 'Super', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 3 /* Fn */, 'Fn', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 4 /* FnLock */, 'FnLock', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 5 /* Suspend */, 'Suspend', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 6 /* Resume */, 'Resume', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 7 /* Turbo */, 'Turbo', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 8 /* Sleep */, 'Sleep', 0 /* Unknown */, empty, 0, 'VK_SLEEP', empty, empty],
-            [0, 1, 9 /* WakeUp */, 'WakeUp', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [31, 0, 10 /* KeyA */, 'KeyA', 31 /* KeyA */, 'A', 65, 'VK_A', empty, empty],
-            [32, 0, 11 /* KeyB */, 'KeyB', 32 /* KeyB */, 'B', 66, 'VK_B', empty, empty],
-            [33, 0, 12 /* KeyC */, 'KeyC', 33 /* KeyC */, 'C', 67, 'VK_C', empty, empty],
-            [34, 0, 13 /* KeyD */, 'KeyD', 34 /* KeyD */, 'D', 68, 'VK_D', empty, empty],
-            [35, 0, 14 /* KeyE */, 'KeyE', 35 /* KeyE */, 'E', 69, 'VK_E', empty, empty],
-            [36, 0, 15 /* KeyF */, 'KeyF', 36 /* KeyF */, 'F', 70, 'VK_F', empty, empty],
-            [37, 0, 16 /* KeyG */, 'KeyG', 37 /* KeyG */, 'G', 71, 'VK_G', empty, empty],
-            [38, 0, 17 /* KeyH */, 'KeyH', 38 /* KeyH */, 'H', 72, 'VK_H', empty, empty],
-            [39, 0, 18 /* KeyI */, 'KeyI', 39 /* KeyI */, 'I', 73, 'VK_I', empty, empty],
-            [40, 0, 19 /* KeyJ */, 'KeyJ', 40 /* KeyJ */, 'J', 74, 'VK_J', empty, empty],
-            [41, 0, 20 /* KeyK */, 'KeyK', 41 /* KeyK */, 'K', 75, 'VK_K', empty, empty],
-            [42, 0, 21 /* KeyL */, 'KeyL', 42 /* KeyL */, 'L', 76, 'VK_L', empty, empty],
-            [43, 0, 22 /* KeyM */, 'KeyM', 43 /* KeyM */, 'M', 77, 'VK_M', empty, empty],
-            [44, 0, 23 /* KeyN */, 'KeyN', 44 /* KeyN */, 'N', 78, 'VK_N', empty, empty],
-            [45, 0, 24 /* KeyO */, 'KeyO', 45 /* KeyO */, 'O', 79, 'VK_O', empty, empty],
-            [46, 0, 25 /* KeyP */, 'KeyP', 46 /* KeyP */, 'P', 80, 'VK_P', empty, empty],
-            [47, 0, 26 /* KeyQ */, 'KeyQ', 47 /* KeyQ */, 'Q', 81, 'VK_Q', empty, empty],
-            [48, 0, 27 /* KeyR */, 'KeyR', 48 /* KeyR */, 'R', 82, 'VK_R', empty, empty],
-            [49, 0, 28 /* KeyS */, 'KeyS', 49 /* KeyS */, 'S', 83, 'VK_S', empty, empty],
-            [50, 0, 29 /* KeyT */, 'KeyT', 50 /* KeyT */, 'T', 84, 'VK_T', empty, empty],
-            [51, 0, 30 /* KeyU */, 'KeyU', 51 /* KeyU */, 'U', 85, 'VK_U', empty, empty],
-            [52, 0, 31 /* KeyV */, 'KeyV', 52 /* KeyV */, 'V', 86, 'VK_V', empty, empty],
-            [53, 0, 32 /* KeyW */, 'KeyW', 53 /* KeyW */, 'W', 87, 'VK_W', empty, empty],
-            [54, 0, 33 /* KeyX */, 'KeyX', 54 /* KeyX */, 'X', 88, 'VK_X', empty, empty],
-            [55, 0, 34 /* KeyY */, 'KeyY', 55 /* KeyY */, 'Y', 89, 'VK_Y', empty, empty],
-            [56, 0, 35 /* KeyZ */, 'KeyZ', 56 /* KeyZ */, 'Z', 90, 'VK_Z', empty, empty],
-            [22, 0, 36 /* Digit1 */, 'Digit1', 22 /* Digit1 */, '1', 49, 'VK_1', empty, empty],
-            [23, 0, 37 /* Digit2 */, 'Digit2', 23 /* Digit2 */, '2', 50, 'VK_2', empty, empty],
-            [24, 0, 38 /* Digit3 */, 'Digit3', 24 /* Digit3 */, '3', 51, 'VK_3', empty, empty],
-            [25, 0, 39 /* Digit4 */, 'Digit4', 25 /* Digit4 */, '4', 52, 'VK_4', empty, empty],
-            [26, 0, 40 /* Digit5 */, 'Digit5', 26 /* Digit5 */, '5', 53, 'VK_5', empty, empty],
-            [27, 0, 41 /* Digit6 */, 'Digit6', 27 /* Digit6 */, '6', 54, 'VK_6', empty, empty],
-            [28, 0, 42 /* Digit7 */, 'Digit7', 28 /* Digit7 */, '7', 55, 'VK_7', empty, empty],
-            [29, 0, 43 /* Digit8 */, 'Digit8', 29 /* Digit8 */, '8', 56, 'VK_8', empty, empty],
-            [30, 0, 44 /* Digit9 */, 'Digit9', 30 /* Digit9 */, '9', 57, 'VK_9', empty, empty],
-            [21, 0, 45 /* Digit0 */, 'Digit0', 21 /* Digit0 */, '0', 48, 'VK_0', empty, empty],
-            [3, 1, 46 /* Enter */, 'Enter', 3 /* Enter */, 'Enter', 13, 'VK_RETURN', empty, empty],
-            [9, 1, 47 /* Escape */, 'Escape', 9 /* Escape */, 'Escape', 27, 'VK_ESCAPE', empty, empty],
-            [1, 1, 48 /* Backspace */, 'Backspace', 1 /* Backspace */, 'Backspace', 8, 'VK_BACK', empty, empty],
-            [2, 1, 49 /* Tab */, 'Tab', 2 /* Tab */, 'Tab', 9, 'VK_TAB', empty, empty],
-            [10, 1, 50 /* Space */, 'Space', 10 /* Space */, 'Space', 32, 'VK_SPACE', empty, empty],
-            [83, 0, 51 /* Minus */, 'Minus', 83 /* Minus */, '-', 189, 'VK_OEM_MINUS', '-', 'OEM_MINUS'],
-            [81, 0, 52 /* Equal */, 'Equal', 81 /* Equal */, '=', 187, 'VK_OEM_PLUS', '=', 'OEM_PLUS'],
-            [87, 0, 53 /* BracketLeft */, 'BracketLeft', 87 /* BracketLeft */, '[', 219, 'VK_OEM_4', '[', 'OEM_4'],
-            [89, 0, 54 /* BracketRight */, 'BracketRight', 89 /* BracketRight */, ']', 221, 'VK_OEM_6', ']', 'OEM_6'],
-            [88, 0, 55 /* Backslash */, 'Backslash', 88 /* Backslash */, '\\', 220, 'VK_OEM_5', '\\', 'OEM_5'],
-            [0, 0, 56 /* IntlHash */, 'IntlHash', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [80, 0, 57 /* Semicolon */, 'Semicolon', 80 /* Semicolon */, ';', 186, 'VK_OEM_1', ';', 'OEM_1'],
-            [90, 0, 58 /* Quote */, 'Quote', 90 /* Quote */, '\'', 222, 'VK_OEM_7', '\'', 'OEM_7'],
-            [86, 0, 59 /* Backquote */, 'Backquote', 86 /* Backquote */, '`', 192, 'VK_OEM_3', '`', 'OEM_3'],
-            [82, 0, 60 /* Comma */, 'Comma', 82 /* Comma */, ',', 188, 'VK_OEM_COMMA', ',', 'OEM_COMMA'],
-            [84, 0, 61 /* Period */, 'Period', 84 /* Period */, '.', 190, 'VK_OEM_PERIOD', '.', 'OEM_PERIOD'],
-            [85, 0, 62 /* Slash */, 'Slash', 85 /* Slash */, '/', 191, 'VK_OEM_2', '/', 'OEM_2'],
-            [8, 1, 63 /* CapsLock */, 'CapsLock', 8 /* CapsLock */, 'CapsLock', 20, 'VK_CAPITAL', empty, empty],
-            [59, 1, 64 /* F1 */, 'F1', 59 /* F1 */, 'F1', 112, 'VK_F1', empty, empty],
-            [60, 1, 65 /* F2 */, 'F2', 60 /* F2 */, 'F2', 113, 'VK_F2', empty, empty],
-            [61, 1, 66 /* F3 */, 'F3', 61 /* F3 */, 'F3', 114, 'VK_F3', empty, empty],
-            [62, 1, 67 /* F4 */, 'F4', 62 /* F4 */, 'F4', 115, 'VK_F4', empty, empty],
-            [63, 1, 68 /* F5 */, 'F5', 63 /* F5 */, 'F5', 116, 'VK_F5', empty, empty],
-            [64, 1, 69 /* F6 */, 'F6', 64 /* F6 */, 'F6', 117, 'VK_F6', empty, empty],
-            [65, 1, 70 /* F7 */, 'F7', 65 /* F7 */, 'F7', 118, 'VK_F7', empty, empty],
-            [66, 1, 71 /* F8 */, 'F8', 66 /* F8 */, 'F8', 119, 'VK_F8', empty, empty],
-            [67, 1, 72 /* F9 */, 'F9', 67 /* F9 */, 'F9', 120, 'VK_F9', empty, empty],
-            [68, 1, 73 /* F10 */, 'F10', 68 /* F10 */, 'F10', 121, 'VK_F10', empty, empty],
-            [69, 1, 74 /* F11 */, 'F11', 69 /* F11 */, 'F11', 122, 'VK_F11', empty, empty],
-            [70, 1, 75 /* F12 */, 'F12', 70 /* F12 */, 'F12', 123, 'VK_F12', empty, empty],
-            [0, 1, 76 /* PrintScreen */, 'PrintScreen', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [79, 1, 77 /* ScrollLock */, 'ScrollLock', 79 /* ScrollLock */, 'ScrollLock', 145, 'VK_SCROLL', empty, empty],
-            [7, 1, 78 /* Pause */, 'Pause', 7 /* PauseBreak */, 'PauseBreak', 19, 'VK_PAUSE', empty, empty],
-            [19, 1, 79 /* Insert */, 'Insert', 19 /* Insert */, 'Insert', 45, 'VK_INSERT', empty, empty],
-            [14, 1, 80 /* Home */, 'Home', 14 /* Home */, 'Home', 36, 'VK_HOME', empty, empty],
-            [11, 1, 81 /* PageUp */, 'PageUp', 11 /* PageUp */, 'PageUp', 33, 'VK_PRIOR', empty, empty],
-            [20, 1, 82 /* Delete */, 'Delete', 20 /* Delete */, 'Delete', 46, 'VK_DELETE', empty, empty],
-            [13, 1, 83 /* End */, 'End', 13 /* End */, 'End', 35, 'VK_END', empty, empty],
-            [12, 1, 84 /* PageDown */, 'PageDown', 12 /* PageDown */, 'PageDown', 34, 'VK_NEXT', empty, empty],
-            [17, 1, 85 /* ArrowRight */, 'ArrowRight', 17 /* RightArrow */, 'RightArrow', 39, 'VK_RIGHT', 'Right', empty],
-            [15, 1, 86 /* ArrowLeft */, 'ArrowLeft', 15 /* LeftArrow */, 'LeftArrow', 37, 'VK_LEFT', 'Left', empty],
-            [18, 1, 87 /* ArrowDown */, 'ArrowDown', 18 /* DownArrow */, 'DownArrow', 40, 'VK_DOWN', 'Down', empty],
-            [16, 1, 88 /* ArrowUp */, 'ArrowUp', 16 /* UpArrow */, 'UpArrow', 38, 'VK_UP', 'Up', empty],
-            [78, 1, 89 /* NumLock */, 'NumLock', 78 /* NumLock */, 'NumLock', 144, 'VK_NUMLOCK', empty, empty],
-            [108, 1, 90 /* NumpadDivide */, 'NumpadDivide', 108 /* NumpadDivide */, 'NumPad_Divide', 111, 'VK_DIVIDE', empty, empty],
-            [103, 1, 91 /* NumpadMultiply */, 'NumpadMultiply', 103 /* NumpadMultiply */, 'NumPad_Multiply', 106, 'VK_MULTIPLY', empty, empty],
-            [106, 1, 92 /* NumpadSubtract */, 'NumpadSubtract', 106 /* NumpadSubtract */, 'NumPad_Subtract', 109, 'VK_SUBTRACT', empty, empty],
-            [104, 1, 93 /* NumpadAdd */, 'NumpadAdd', 104 /* NumpadAdd */, 'NumPad_Add', 107, 'VK_ADD', empty, empty],
-            [3, 1, 94 /* NumpadEnter */, 'NumpadEnter', 3 /* Enter */, empty, 0, empty, empty, empty],
-            [94, 1, 95 /* Numpad1 */, 'Numpad1', 94 /* Numpad1 */, 'NumPad1', 97, 'VK_NUMPAD1', empty, empty],
-            [95, 1, 96 /* Numpad2 */, 'Numpad2', 95 /* Numpad2 */, 'NumPad2', 98, 'VK_NUMPAD2', empty, empty],
-            [96, 1, 97 /* Numpad3 */, 'Numpad3', 96 /* Numpad3 */, 'NumPad3', 99, 'VK_NUMPAD3', empty, empty],
-            [97, 1, 98 /* Numpad4 */, 'Numpad4', 97 /* Numpad4 */, 'NumPad4', 100, 'VK_NUMPAD4', empty, empty],
-            [98, 1, 99 /* Numpad5 */, 'Numpad5', 98 /* Numpad5 */, 'NumPad5', 101, 'VK_NUMPAD5', empty, empty],
-            [99, 1, 100 /* Numpad6 */, 'Numpad6', 99 /* Numpad6 */, 'NumPad6', 102, 'VK_NUMPAD6', empty, empty],
-            [100, 1, 101 /* Numpad7 */, 'Numpad7', 100 /* Numpad7 */, 'NumPad7', 103, 'VK_NUMPAD7', empty, empty],
-            [101, 1, 102 /* Numpad8 */, 'Numpad8', 101 /* Numpad8 */, 'NumPad8', 104, 'VK_NUMPAD8', empty, empty],
-            [102, 1, 103 /* Numpad9 */, 'Numpad9', 102 /* Numpad9 */, 'NumPad9', 105, 'VK_NUMPAD9', empty, empty],
-            [93, 1, 104 /* Numpad0 */, 'Numpad0', 93 /* Numpad0 */, 'NumPad0', 96, 'VK_NUMPAD0', empty, empty],
-            [107, 1, 105 /* NumpadDecimal */, 'NumpadDecimal', 107 /* NumpadDecimal */, 'NumPad_Decimal', 110, 'VK_DECIMAL', empty, empty],
-            [92, 0, 106 /* IntlBackslash */, 'IntlBackslash', 92 /* IntlBackslash */, 'OEM_102', 226, 'VK_OEM_102', empty, empty],
-            [58, 1, 107 /* ContextMenu */, 'ContextMenu', 58 /* ContextMenu */, 'ContextMenu', 93, empty, empty, empty],
-            [0, 1, 108 /* Power */, 'Power', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 109 /* NumpadEqual */, 'NumpadEqual', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [71, 1, 110 /* F13 */, 'F13', 71 /* F13 */, 'F13', 124, 'VK_F13', empty, empty],
-            [72, 1, 111 /* F14 */, 'F14', 72 /* F14 */, 'F14', 125, 'VK_F14', empty, empty],
-            [73, 1, 112 /* F15 */, 'F15', 73 /* F15 */, 'F15', 126, 'VK_F15', empty, empty],
-            [74, 1, 113 /* F16 */, 'F16', 74 /* F16 */, 'F16', 127, 'VK_F16', empty, empty],
-            [75, 1, 114 /* F17 */, 'F17', 75 /* F17 */, 'F17', 128, 'VK_F17', empty, empty],
-            [76, 1, 115 /* F18 */, 'F18', 76 /* F18 */, 'F18', 129, 'VK_F18', empty, empty],
-            [77, 1, 116 /* F19 */, 'F19', 77 /* F19 */, 'F19', 130, 'VK_F19', empty, empty],
-            [0, 1, 117 /* F20 */, 'F20', 0 /* Unknown */, empty, 0, 'VK_F20', empty, empty],
-            [0, 1, 118 /* F21 */, 'F21', 0 /* Unknown */, empty, 0, 'VK_F21', empty, empty],
-            [0, 1, 119 /* F22 */, 'F22', 0 /* Unknown */, empty, 0, 'VK_F22', empty, empty],
-            [0, 1, 120 /* F23 */, 'F23', 0 /* Unknown */, empty, 0, 'VK_F23', empty, empty],
-            [0, 1, 121 /* F24 */, 'F24', 0 /* Unknown */, empty, 0, 'VK_F24', empty, empty],
-            [0, 1, 122 /* Open */, 'Open', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 123 /* Help */, 'Help', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 124 /* Select */, 'Select', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 125 /* Again */, 'Again', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 126 /* Undo */, 'Undo', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 127 /* Cut */, 'Cut', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 128 /* Copy */, 'Copy', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 129 /* Paste */, 'Paste', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 130 /* Find */, 'Find', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 131 /* AudioVolumeMute */, 'AudioVolumeMute', 112 /* AudioVolumeMute */, 'AudioVolumeMute', 173, 'VK_VOLUME_MUTE', empty, empty],
-            [0, 1, 132 /* AudioVolumeUp */, 'AudioVolumeUp', 113 /* AudioVolumeUp */, 'AudioVolumeUp', 175, 'VK_VOLUME_UP', empty, empty],
-            [0, 1, 133 /* AudioVolumeDown */, 'AudioVolumeDown', 114 /* AudioVolumeDown */, 'AudioVolumeDown', 174, 'VK_VOLUME_DOWN', empty, empty],
-            [105, 1, 134 /* NumpadComma */, 'NumpadComma', 105 /* NUMPAD_SEPARATOR */, 'NumPad_Separator', 108, 'VK_SEPARATOR', empty, empty],
-            [110, 0, 135 /* IntlRo */, 'IntlRo', 110 /* ABNT_C1 */, 'ABNT_C1', 193, 'VK_ABNT_C1', empty, empty],
-            [0, 1, 136 /* KanaMode */, 'KanaMode', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 0, 137 /* IntlYen */, 'IntlYen', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 138 /* Convert */, 'Convert', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 139 /* NonConvert */, 'NonConvert', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 140 /* Lang1 */, 'Lang1', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 141 /* Lang2 */, 'Lang2', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 142 /* Lang3 */, 'Lang3', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 143 /* Lang4 */, 'Lang4', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 144 /* Lang5 */, 'Lang5', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 145 /* Abort */, 'Abort', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 146 /* Props */, 'Props', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 147 /* NumpadParenLeft */, 'NumpadParenLeft', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 148 /* NumpadParenRight */, 'NumpadParenRight', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 149 /* NumpadBackspace */, 'NumpadBackspace', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 150 /* NumpadMemoryStore */, 'NumpadMemoryStore', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 151 /* NumpadMemoryRecall */, 'NumpadMemoryRecall', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 152 /* NumpadMemoryClear */, 'NumpadMemoryClear', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 153 /* NumpadMemoryAdd */, 'NumpadMemoryAdd', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 154 /* NumpadMemorySubtract */, 'NumpadMemorySubtract', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 155 /* NumpadClear */, 'NumpadClear', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 156 /* NumpadClearEntry */, 'NumpadClearEntry', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [5, 1, 0 /* None */, empty, 5 /* Ctrl */, 'Ctrl', 17, 'VK_CONTROL', empty, empty],
-            [4, 1, 0 /* None */, empty, 4 /* Shift */, 'Shift', 16, 'VK_SHIFT', empty, empty],
-            [6, 1, 0 /* None */, empty, 6 /* Alt */, 'Alt', 18, 'VK_MENU', empty, empty],
-            [57, 1, 0 /* None */, empty, 57 /* Meta */, 'Meta', 0, 'VK_COMMAND', empty, empty],
-            [5, 1, 157 /* ControlLeft */, 'ControlLeft', 5 /* Ctrl */, empty, 0, 'VK_LCONTROL', empty, empty],
-            [4, 1, 158 /* ShiftLeft */, 'ShiftLeft', 4 /* Shift */, empty, 0, 'VK_LSHIFT', empty, empty],
-            [6, 1, 159 /* AltLeft */, 'AltLeft', 6 /* Alt */, empty, 0, 'VK_LMENU', empty, empty],
-            [57, 1, 160 /* MetaLeft */, 'MetaLeft', 57 /* Meta */, empty, 0, 'VK_LWIN', empty, empty],
-            [5, 1, 161 /* ControlRight */, 'ControlRight', 5 /* Ctrl */, empty, 0, 'VK_RCONTROL', empty, empty],
-            [4, 1, 162 /* ShiftRight */, 'ShiftRight', 4 /* Shift */, empty, 0, 'VK_RSHIFT', empty, empty],
-            [6, 1, 163 /* AltRight */, 'AltRight', 6 /* Alt */, empty, 0, 'VK_RMENU', empty, empty],
-            [57, 1, 164 /* MetaRight */, 'MetaRight', 57 /* Meta */, empty, 0, 'VK_RWIN', empty, empty],
-            [0, 1, 165 /* BrightnessUp */, 'BrightnessUp', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 166 /* BrightnessDown */, 'BrightnessDown', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 167 /* MediaPlay */, 'MediaPlay', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 168 /* MediaRecord */, 'MediaRecord', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 169 /* MediaFastForward */, 'MediaFastForward', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 170 /* MediaRewind */, 'MediaRewind', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [114, 1, 171 /* MediaTrackNext */, 'MediaTrackNext', 119 /* MediaTrackNext */, 'MediaTrackNext', 176, 'VK_MEDIA_NEXT_TRACK', empty, empty],
-            [115, 1, 172 /* MediaTrackPrevious */, 'MediaTrackPrevious', 120 /* MediaTrackPrevious */, 'MediaTrackPrevious', 177, 'VK_MEDIA_PREV_TRACK', empty, empty],
-            [116, 1, 173 /* MediaStop */, 'MediaStop', 121 /* MediaStop */, 'MediaStop', 178, 'VK_MEDIA_STOP', empty, empty],
-            [0, 1, 174 /* Eject */, 'Eject', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [117, 1, 175 /* MediaPlayPause */, 'MediaPlayPause', 122 /* MediaPlayPause */, 'MediaPlayPause', 179, 'VK_MEDIA_PLAY_PAUSE', empty, empty],
-            [0, 1, 176 /* MediaSelect */, 'MediaSelect', 123 /* LaunchMediaPlayer */, 'LaunchMediaPlayer', 181, 'VK_MEDIA_LAUNCH_MEDIA_SELECT', empty, empty],
-            [0, 1, 177 /* LaunchMail */, 'LaunchMail', 124 /* LaunchMail */, 'LaunchMail', 180, 'VK_MEDIA_LAUNCH_MAIL', empty, empty],
-            [0, 1, 178 /* LaunchApp2 */, 'LaunchApp2', 125 /* LaunchApp2 */, 'LaunchApp2', 183, 'VK_MEDIA_LAUNCH_APP2', empty, empty],
-            [0, 1, 179 /* LaunchApp1 */, 'LaunchApp1', 0 /* Unknown */, empty, 0, 'VK_MEDIA_LAUNCH_APP1', empty, empty],
-            [0, 1, 180 /* SelectTask */, 'SelectTask', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 181 /* LaunchScreenSaver */, 'LaunchScreenSaver', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 182 /* BrowserSearch */, 'BrowserSearch', 115 /* BrowserSearch */, 'BrowserSearch', 170, 'VK_BROWSER_SEARCH', empty, empty],
-            [0, 1, 183 /* BrowserHome */, 'BrowserHome', 116 /* BrowserHome */, 'BrowserHome', 172, 'VK_BROWSER_HOME', empty, empty],
-            [112, 1, 184 /* BrowserBack */, 'BrowserBack', 117 /* BrowserBack */, 'BrowserBack', 166, 'VK_BROWSER_BACK', empty, empty],
-            [113, 1, 185 /* BrowserForward */, 'BrowserForward', 118 /* BrowserForward */, 'BrowserForward', 167, 'VK_BROWSER_FORWARD', empty, empty],
-            [0, 1, 186 /* BrowserStop */, 'BrowserStop', 0 /* Unknown */, empty, 0, 'VK_BROWSER_STOP', empty, empty],
-            [0, 1, 187 /* BrowserRefresh */, 'BrowserRefresh', 0 /* Unknown */, empty, 0, 'VK_BROWSER_REFRESH', empty, empty],
-            [0, 1, 188 /* BrowserFavorites */, 'BrowserFavorites', 0 /* Unknown */, empty, 0, 'VK_BROWSER_FAVORITES', empty, empty],
-            [0, 1, 189 /* ZoomToggle */, 'ZoomToggle', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 190 /* MailReply */, 'MailReply', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 191 /* MailForward */, 'MailForward', 0 /* Unknown */, empty, 0, empty, empty, empty],
-            [0, 1, 192 /* MailSend */, 'MailSend', 0 /* Unknown */, empty, 0, empty, empty, empty],
+            // immutable, scanCode, scanCodeStr, keyCode, keyCodeStr, eventKeyCode, vkey, usUserSettingsLabel, generalUserSettingsLabel
+            [1, 0 /* ScanCode.None */, 'None', 0 /* KeyCode.Unknown */, 'unknown', 0, 'VK_UNKNOWN', empty, empty],
+            [1, 1 /* ScanCode.Hyper */, 'Hyper', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 2 /* ScanCode.Super */, 'Super', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 3 /* ScanCode.Fn */, 'Fn', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 4 /* ScanCode.FnLock */, 'FnLock', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 5 /* ScanCode.Suspend */, 'Suspend', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 6 /* ScanCode.Resume */, 'Resume', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 7 /* ScanCode.Turbo */, 'Turbo', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 8 /* ScanCode.Sleep */, 'Sleep', 0 /* KeyCode.Unknown */, empty, 0, 'VK_SLEEP', empty, empty],
+            [1, 9 /* ScanCode.WakeUp */, 'WakeUp', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [0, 10 /* ScanCode.KeyA */, 'KeyA', 31 /* KeyCode.KeyA */, 'A', 65, 'VK_A', empty, empty],
+            [0, 11 /* ScanCode.KeyB */, 'KeyB', 32 /* KeyCode.KeyB */, 'B', 66, 'VK_B', empty, empty],
+            [0, 12 /* ScanCode.KeyC */, 'KeyC', 33 /* KeyCode.KeyC */, 'C', 67, 'VK_C', empty, empty],
+            [0, 13 /* ScanCode.KeyD */, 'KeyD', 34 /* KeyCode.KeyD */, 'D', 68, 'VK_D', empty, empty],
+            [0, 14 /* ScanCode.KeyE */, 'KeyE', 35 /* KeyCode.KeyE */, 'E', 69, 'VK_E', empty, empty],
+            [0, 15 /* ScanCode.KeyF */, 'KeyF', 36 /* KeyCode.KeyF */, 'F', 70, 'VK_F', empty, empty],
+            [0, 16 /* ScanCode.KeyG */, 'KeyG', 37 /* KeyCode.KeyG */, 'G', 71, 'VK_G', empty, empty],
+            [0, 17 /* ScanCode.KeyH */, 'KeyH', 38 /* KeyCode.KeyH */, 'H', 72, 'VK_H', empty, empty],
+            [0, 18 /* ScanCode.KeyI */, 'KeyI', 39 /* KeyCode.KeyI */, 'I', 73, 'VK_I', empty, empty],
+            [0, 19 /* ScanCode.KeyJ */, 'KeyJ', 40 /* KeyCode.KeyJ */, 'J', 74, 'VK_J', empty, empty],
+            [0, 20 /* ScanCode.KeyK */, 'KeyK', 41 /* KeyCode.KeyK */, 'K', 75, 'VK_K', empty, empty],
+            [0, 21 /* ScanCode.KeyL */, 'KeyL', 42 /* KeyCode.KeyL */, 'L', 76, 'VK_L', empty, empty],
+            [0, 22 /* ScanCode.KeyM */, 'KeyM', 43 /* KeyCode.KeyM */, 'M', 77, 'VK_M', empty, empty],
+            [0, 23 /* ScanCode.KeyN */, 'KeyN', 44 /* KeyCode.KeyN */, 'N', 78, 'VK_N', empty, empty],
+            [0, 24 /* ScanCode.KeyO */, 'KeyO', 45 /* KeyCode.KeyO */, 'O', 79, 'VK_O', empty, empty],
+            [0, 25 /* ScanCode.KeyP */, 'KeyP', 46 /* KeyCode.KeyP */, 'P', 80, 'VK_P', empty, empty],
+            [0, 26 /* ScanCode.KeyQ */, 'KeyQ', 47 /* KeyCode.KeyQ */, 'Q', 81, 'VK_Q', empty, empty],
+            [0, 27 /* ScanCode.KeyR */, 'KeyR', 48 /* KeyCode.KeyR */, 'R', 82, 'VK_R', empty, empty],
+            [0, 28 /* ScanCode.KeyS */, 'KeyS', 49 /* KeyCode.KeyS */, 'S', 83, 'VK_S', empty, empty],
+            [0, 29 /* ScanCode.KeyT */, 'KeyT', 50 /* KeyCode.KeyT */, 'T', 84, 'VK_T', empty, empty],
+            [0, 30 /* ScanCode.KeyU */, 'KeyU', 51 /* KeyCode.KeyU */, 'U', 85, 'VK_U', empty, empty],
+            [0, 31 /* ScanCode.KeyV */, 'KeyV', 52 /* KeyCode.KeyV */, 'V', 86, 'VK_V', empty, empty],
+            [0, 32 /* ScanCode.KeyW */, 'KeyW', 53 /* KeyCode.KeyW */, 'W', 87, 'VK_W', empty, empty],
+            [0, 33 /* ScanCode.KeyX */, 'KeyX', 54 /* KeyCode.KeyX */, 'X', 88, 'VK_X', empty, empty],
+            [0, 34 /* ScanCode.KeyY */, 'KeyY', 55 /* KeyCode.KeyY */, 'Y', 89, 'VK_Y', empty, empty],
+            [0, 35 /* ScanCode.KeyZ */, 'KeyZ', 56 /* KeyCode.KeyZ */, 'Z', 90, 'VK_Z', empty, empty],
+            [0, 36 /* ScanCode.Digit1 */, 'Digit1', 22 /* KeyCode.Digit1 */, '1', 49, 'VK_1', empty, empty],
+            [0, 37 /* ScanCode.Digit2 */, 'Digit2', 23 /* KeyCode.Digit2 */, '2', 50, 'VK_2', empty, empty],
+            [0, 38 /* ScanCode.Digit3 */, 'Digit3', 24 /* KeyCode.Digit3 */, '3', 51, 'VK_3', empty, empty],
+            [0, 39 /* ScanCode.Digit4 */, 'Digit4', 25 /* KeyCode.Digit4 */, '4', 52, 'VK_4', empty, empty],
+            [0, 40 /* ScanCode.Digit5 */, 'Digit5', 26 /* KeyCode.Digit5 */, '5', 53, 'VK_5', empty, empty],
+            [0, 41 /* ScanCode.Digit6 */, 'Digit6', 27 /* KeyCode.Digit6 */, '6', 54, 'VK_6', empty, empty],
+            [0, 42 /* ScanCode.Digit7 */, 'Digit7', 28 /* KeyCode.Digit7 */, '7', 55, 'VK_7', empty, empty],
+            [0, 43 /* ScanCode.Digit8 */, 'Digit8', 29 /* KeyCode.Digit8 */, '8', 56, 'VK_8', empty, empty],
+            [0, 44 /* ScanCode.Digit9 */, 'Digit9', 30 /* KeyCode.Digit9 */, '9', 57, 'VK_9', empty, empty],
+            [0, 45 /* ScanCode.Digit0 */, 'Digit0', 21 /* KeyCode.Digit0 */, '0', 48, 'VK_0', empty, empty],
+            [1, 46 /* ScanCode.Enter */, 'Enter', 3 /* KeyCode.Enter */, 'Enter', 13, 'VK_RETURN', empty, empty],
+            [1, 47 /* ScanCode.Escape */, 'Escape', 9 /* KeyCode.Escape */, 'Escape', 27, 'VK_ESCAPE', empty, empty],
+            [1, 48 /* ScanCode.Backspace */, 'Backspace', 1 /* KeyCode.Backspace */, 'Backspace', 8, 'VK_BACK', empty, empty],
+            [1, 49 /* ScanCode.Tab */, 'Tab', 2 /* KeyCode.Tab */, 'Tab', 9, 'VK_TAB', empty, empty],
+            [1, 50 /* ScanCode.Space */, 'Space', 10 /* KeyCode.Space */, 'Space', 32, 'VK_SPACE', empty, empty],
+            [0, 51 /* ScanCode.Minus */, 'Minus', 88 /* KeyCode.Minus */, '-', 189, 'VK_OEM_MINUS', '-', 'OEM_MINUS'],
+            [0, 52 /* ScanCode.Equal */, 'Equal', 86 /* KeyCode.Equal */, '=', 187, 'VK_OEM_PLUS', '=', 'OEM_PLUS'],
+            [0, 53 /* ScanCode.BracketLeft */, 'BracketLeft', 92 /* KeyCode.BracketLeft */, '[', 219, 'VK_OEM_4', '[', 'OEM_4'],
+            [0, 54 /* ScanCode.BracketRight */, 'BracketRight', 94 /* KeyCode.BracketRight */, ']', 221, 'VK_OEM_6', ']', 'OEM_6'],
+            [0, 55 /* ScanCode.Backslash */, 'Backslash', 93 /* KeyCode.Backslash */, '\\', 220, 'VK_OEM_5', '\\', 'OEM_5'],
+            [0, 56 /* ScanCode.IntlHash */, 'IntlHash', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [0, 57 /* ScanCode.Semicolon */, 'Semicolon', 85 /* KeyCode.Semicolon */, ';', 186, 'VK_OEM_1', ';', 'OEM_1'],
+            [0, 58 /* ScanCode.Quote */, 'Quote', 95 /* KeyCode.Quote */, '\'', 222, 'VK_OEM_7', '\'', 'OEM_7'],
+            [0, 59 /* ScanCode.Backquote */, 'Backquote', 91 /* KeyCode.Backquote */, '`', 192, 'VK_OEM_3', '`', 'OEM_3'],
+            [0, 60 /* ScanCode.Comma */, 'Comma', 87 /* KeyCode.Comma */, ',', 188, 'VK_OEM_COMMA', ',', 'OEM_COMMA'],
+            [0, 61 /* ScanCode.Period */, 'Period', 89 /* KeyCode.Period */, '.', 190, 'VK_OEM_PERIOD', '.', 'OEM_PERIOD'],
+            [0, 62 /* ScanCode.Slash */, 'Slash', 90 /* KeyCode.Slash */, '/', 191, 'VK_OEM_2', '/', 'OEM_2'],
+            [1, 63 /* ScanCode.CapsLock */, 'CapsLock', 8 /* KeyCode.CapsLock */, 'CapsLock', 20, 'VK_CAPITAL', empty, empty],
+            [1, 64 /* ScanCode.F1 */, 'F1', 59 /* KeyCode.F1 */, 'F1', 112, 'VK_F1', empty, empty],
+            [1, 65 /* ScanCode.F2 */, 'F2', 60 /* KeyCode.F2 */, 'F2', 113, 'VK_F2', empty, empty],
+            [1, 66 /* ScanCode.F3 */, 'F3', 61 /* KeyCode.F3 */, 'F3', 114, 'VK_F3', empty, empty],
+            [1, 67 /* ScanCode.F4 */, 'F4', 62 /* KeyCode.F4 */, 'F4', 115, 'VK_F4', empty, empty],
+            [1, 68 /* ScanCode.F5 */, 'F5', 63 /* KeyCode.F5 */, 'F5', 116, 'VK_F5', empty, empty],
+            [1, 69 /* ScanCode.F6 */, 'F6', 64 /* KeyCode.F6 */, 'F6', 117, 'VK_F6', empty, empty],
+            [1, 70 /* ScanCode.F7 */, 'F7', 65 /* KeyCode.F7 */, 'F7', 118, 'VK_F7', empty, empty],
+            [1, 71 /* ScanCode.F8 */, 'F8', 66 /* KeyCode.F8 */, 'F8', 119, 'VK_F8', empty, empty],
+            [1, 72 /* ScanCode.F9 */, 'F9', 67 /* KeyCode.F9 */, 'F9', 120, 'VK_F9', empty, empty],
+            [1, 73 /* ScanCode.F10 */, 'F10', 68 /* KeyCode.F10 */, 'F10', 121, 'VK_F10', empty, empty],
+            [1, 74 /* ScanCode.F11 */, 'F11', 69 /* KeyCode.F11 */, 'F11', 122, 'VK_F11', empty, empty],
+            [1, 75 /* ScanCode.F12 */, 'F12', 70 /* KeyCode.F12 */, 'F12', 123, 'VK_F12', empty, empty],
+            [1, 76 /* ScanCode.PrintScreen */, 'PrintScreen', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 77 /* ScanCode.ScrollLock */, 'ScrollLock', 84 /* KeyCode.ScrollLock */, 'ScrollLock', 145, 'VK_SCROLL', empty, empty],
+            [1, 78 /* ScanCode.Pause */, 'Pause', 7 /* KeyCode.PauseBreak */, 'PauseBreak', 19, 'VK_PAUSE', empty, empty],
+            [1, 79 /* ScanCode.Insert */, 'Insert', 19 /* KeyCode.Insert */, 'Insert', 45, 'VK_INSERT', empty, empty],
+            [1, 80 /* ScanCode.Home */, 'Home', 14 /* KeyCode.Home */, 'Home', 36, 'VK_HOME', empty, empty],
+            [1, 81 /* ScanCode.PageUp */, 'PageUp', 11 /* KeyCode.PageUp */, 'PageUp', 33, 'VK_PRIOR', empty, empty],
+            [1, 82 /* ScanCode.Delete */, 'Delete', 20 /* KeyCode.Delete */, 'Delete', 46, 'VK_DELETE', empty, empty],
+            [1, 83 /* ScanCode.End */, 'End', 13 /* KeyCode.End */, 'End', 35, 'VK_END', empty, empty],
+            [1, 84 /* ScanCode.PageDown */, 'PageDown', 12 /* KeyCode.PageDown */, 'PageDown', 34, 'VK_NEXT', empty, empty],
+            [1, 85 /* ScanCode.ArrowRight */, 'ArrowRight', 17 /* KeyCode.RightArrow */, 'RightArrow', 39, 'VK_RIGHT', 'Right', empty],
+            [1, 86 /* ScanCode.ArrowLeft */, 'ArrowLeft', 15 /* KeyCode.LeftArrow */, 'LeftArrow', 37, 'VK_LEFT', 'Left', empty],
+            [1, 87 /* ScanCode.ArrowDown */, 'ArrowDown', 18 /* KeyCode.DownArrow */, 'DownArrow', 40, 'VK_DOWN', 'Down', empty],
+            [1, 88 /* ScanCode.ArrowUp */, 'ArrowUp', 16 /* KeyCode.UpArrow */, 'UpArrow', 38, 'VK_UP', 'Up', empty],
+            [1, 89 /* ScanCode.NumLock */, 'NumLock', 83 /* KeyCode.NumLock */, 'NumLock', 144, 'VK_NUMLOCK', empty, empty],
+            [1, 90 /* ScanCode.NumpadDivide */, 'NumpadDivide', 113 /* KeyCode.NumpadDivide */, 'NumPad_Divide', 111, 'VK_DIVIDE', empty, empty],
+            [1, 91 /* ScanCode.NumpadMultiply */, 'NumpadMultiply', 108 /* KeyCode.NumpadMultiply */, 'NumPad_Multiply', 106, 'VK_MULTIPLY', empty, empty],
+            [1, 92 /* ScanCode.NumpadSubtract */, 'NumpadSubtract', 111 /* KeyCode.NumpadSubtract */, 'NumPad_Subtract', 109, 'VK_SUBTRACT', empty, empty],
+            [1, 93 /* ScanCode.NumpadAdd */, 'NumpadAdd', 109 /* KeyCode.NumpadAdd */, 'NumPad_Add', 107, 'VK_ADD', empty, empty],
+            [1, 94 /* ScanCode.NumpadEnter */, 'NumpadEnter', 3 /* KeyCode.Enter */, empty, 0, empty, empty, empty],
+            [1, 95 /* ScanCode.Numpad1 */, 'Numpad1', 99 /* KeyCode.Numpad1 */, 'NumPad1', 97, 'VK_NUMPAD1', empty, empty],
+            [1, 96 /* ScanCode.Numpad2 */, 'Numpad2', 100 /* KeyCode.Numpad2 */, 'NumPad2', 98, 'VK_NUMPAD2', empty, empty],
+            [1, 97 /* ScanCode.Numpad3 */, 'Numpad3', 101 /* KeyCode.Numpad3 */, 'NumPad3', 99, 'VK_NUMPAD3', empty, empty],
+            [1, 98 /* ScanCode.Numpad4 */, 'Numpad4', 102 /* KeyCode.Numpad4 */, 'NumPad4', 100, 'VK_NUMPAD4', empty, empty],
+            [1, 99 /* ScanCode.Numpad5 */, 'Numpad5', 103 /* KeyCode.Numpad5 */, 'NumPad5', 101, 'VK_NUMPAD5', empty, empty],
+            [1, 100 /* ScanCode.Numpad6 */, 'Numpad6', 104 /* KeyCode.Numpad6 */, 'NumPad6', 102, 'VK_NUMPAD6', empty, empty],
+            [1, 101 /* ScanCode.Numpad7 */, 'Numpad7', 105 /* KeyCode.Numpad7 */, 'NumPad7', 103, 'VK_NUMPAD7', empty, empty],
+            [1, 102 /* ScanCode.Numpad8 */, 'Numpad8', 106 /* KeyCode.Numpad8 */, 'NumPad8', 104, 'VK_NUMPAD8', empty, empty],
+            [1, 103 /* ScanCode.Numpad9 */, 'Numpad9', 107 /* KeyCode.Numpad9 */, 'NumPad9', 105, 'VK_NUMPAD9', empty, empty],
+            [1, 104 /* ScanCode.Numpad0 */, 'Numpad0', 98 /* KeyCode.Numpad0 */, 'NumPad0', 96, 'VK_NUMPAD0', empty, empty],
+            [1, 105 /* ScanCode.NumpadDecimal */, 'NumpadDecimal', 112 /* KeyCode.NumpadDecimal */, 'NumPad_Decimal', 110, 'VK_DECIMAL', empty, empty],
+            [0, 106 /* ScanCode.IntlBackslash */, 'IntlBackslash', 97 /* KeyCode.IntlBackslash */, 'OEM_102', 226, 'VK_OEM_102', empty, empty],
+            [1, 107 /* ScanCode.ContextMenu */, 'ContextMenu', 58 /* KeyCode.ContextMenu */, 'ContextMenu', 93, empty, empty, empty],
+            [1, 108 /* ScanCode.Power */, 'Power', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 109 /* ScanCode.NumpadEqual */, 'NumpadEqual', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 110 /* ScanCode.F13 */, 'F13', 71 /* KeyCode.F13 */, 'F13', 124, 'VK_F13', empty, empty],
+            [1, 111 /* ScanCode.F14 */, 'F14', 72 /* KeyCode.F14 */, 'F14', 125, 'VK_F14', empty, empty],
+            [1, 112 /* ScanCode.F15 */, 'F15', 73 /* KeyCode.F15 */, 'F15', 126, 'VK_F15', empty, empty],
+            [1, 113 /* ScanCode.F16 */, 'F16', 74 /* KeyCode.F16 */, 'F16', 127, 'VK_F16', empty, empty],
+            [1, 114 /* ScanCode.F17 */, 'F17', 75 /* KeyCode.F17 */, 'F17', 128, 'VK_F17', empty, empty],
+            [1, 115 /* ScanCode.F18 */, 'F18', 76 /* KeyCode.F18 */, 'F18', 129, 'VK_F18', empty, empty],
+            [1, 116 /* ScanCode.F19 */, 'F19', 77 /* KeyCode.F19 */, 'F19', 130, 'VK_F19', empty, empty],
+            [1, 117 /* ScanCode.F20 */, 'F20', 78 /* KeyCode.F20 */, 'F20', 131, 'VK_F20', empty, empty],
+            [1, 118 /* ScanCode.F21 */, 'F21', 79 /* KeyCode.F21 */, 'F21', 132, 'VK_F21', empty, empty],
+            [1, 119 /* ScanCode.F22 */, 'F22', 80 /* KeyCode.F22 */, 'F22', 133, 'VK_F22', empty, empty],
+            [1, 120 /* ScanCode.F23 */, 'F23', 81 /* KeyCode.F23 */, 'F23', 134, 'VK_F23', empty, empty],
+            [1, 121 /* ScanCode.F24 */, 'F24', 82 /* KeyCode.F24 */, 'F24', 135, 'VK_F24', empty, empty],
+            [1, 122 /* ScanCode.Open */, 'Open', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 123 /* ScanCode.Help */, 'Help', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 124 /* ScanCode.Select */, 'Select', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 125 /* ScanCode.Again */, 'Again', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 126 /* ScanCode.Undo */, 'Undo', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 127 /* ScanCode.Cut */, 'Cut', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 128 /* ScanCode.Copy */, 'Copy', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 129 /* ScanCode.Paste */, 'Paste', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 130 /* ScanCode.Find */, 'Find', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 131 /* ScanCode.AudioVolumeMute */, 'AudioVolumeMute', 117 /* KeyCode.AudioVolumeMute */, 'AudioVolumeMute', 173, 'VK_VOLUME_MUTE', empty, empty],
+            [1, 132 /* ScanCode.AudioVolumeUp */, 'AudioVolumeUp', 118 /* KeyCode.AudioVolumeUp */, 'AudioVolumeUp', 175, 'VK_VOLUME_UP', empty, empty],
+            [1, 133 /* ScanCode.AudioVolumeDown */, 'AudioVolumeDown', 119 /* KeyCode.AudioVolumeDown */, 'AudioVolumeDown', 174, 'VK_VOLUME_DOWN', empty, empty],
+            [1, 134 /* ScanCode.NumpadComma */, 'NumpadComma', 110 /* KeyCode.NUMPAD_SEPARATOR */, 'NumPad_Separator', 108, 'VK_SEPARATOR', empty, empty],
+            [0, 135 /* ScanCode.IntlRo */, 'IntlRo', 115 /* KeyCode.ABNT_C1 */, 'ABNT_C1', 193, 'VK_ABNT_C1', empty, empty],
+            [1, 136 /* ScanCode.KanaMode */, 'KanaMode', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [0, 137 /* ScanCode.IntlYen */, 'IntlYen', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 138 /* ScanCode.Convert */, 'Convert', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 139 /* ScanCode.NonConvert */, 'NonConvert', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 140 /* ScanCode.Lang1 */, 'Lang1', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 141 /* ScanCode.Lang2 */, 'Lang2', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 142 /* ScanCode.Lang3 */, 'Lang3', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 143 /* ScanCode.Lang4 */, 'Lang4', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 144 /* ScanCode.Lang5 */, 'Lang5', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 145 /* ScanCode.Abort */, 'Abort', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 146 /* ScanCode.Props */, 'Props', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 147 /* ScanCode.NumpadParenLeft */, 'NumpadParenLeft', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 148 /* ScanCode.NumpadParenRight */, 'NumpadParenRight', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 149 /* ScanCode.NumpadBackspace */, 'NumpadBackspace', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 150 /* ScanCode.NumpadMemoryStore */, 'NumpadMemoryStore', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 151 /* ScanCode.NumpadMemoryRecall */, 'NumpadMemoryRecall', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 152 /* ScanCode.NumpadMemoryClear */, 'NumpadMemoryClear', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 153 /* ScanCode.NumpadMemoryAdd */, 'NumpadMemoryAdd', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 154 /* ScanCode.NumpadMemorySubtract */, 'NumpadMemorySubtract', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 155 /* ScanCode.NumpadClear */, 'NumpadClear', 131 /* KeyCode.Clear */, 'Clear', 12, 'VK_CLEAR', empty, empty],
+            [1, 156 /* ScanCode.NumpadClearEntry */, 'NumpadClearEntry', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 5 /* KeyCode.Ctrl */, 'Ctrl', 17, 'VK_CONTROL', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 4 /* KeyCode.Shift */, 'Shift', 16, 'VK_SHIFT', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 6 /* KeyCode.Alt */, 'Alt', 18, 'VK_MENU', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 57 /* KeyCode.Meta */, 'Meta', 91, 'VK_COMMAND', empty, empty],
+            [1, 157 /* ScanCode.ControlLeft */, 'ControlLeft', 5 /* KeyCode.Ctrl */, empty, 0, 'VK_LCONTROL', empty, empty],
+            [1, 158 /* ScanCode.ShiftLeft */, 'ShiftLeft', 4 /* KeyCode.Shift */, empty, 0, 'VK_LSHIFT', empty, empty],
+            [1, 159 /* ScanCode.AltLeft */, 'AltLeft', 6 /* KeyCode.Alt */, empty, 0, 'VK_LMENU', empty, empty],
+            [1, 160 /* ScanCode.MetaLeft */, 'MetaLeft', 57 /* KeyCode.Meta */, empty, 0, 'VK_LWIN', empty, empty],
+            [1, 161 /* ScanCode.ControlRight */, 'ControlRight', 5 /* KeyCode.Ctrl */, empty, 0, 'VK_RCONTROL', empty, empty],
+            [1, 162 /* ScanCode.ShiftRight */, 'ShiftRight', 4 /* KeyCode.Shift */, empty, 0, 'VK_RSHIFT', empty, empty],
+            [1, 163 /* ScanCode.AltRight */, 'AltRight', 6 /* KeyCode.Alt */, empty, 0, 'VK_RMENU', empty, empty],
+            [1, 164 /* ScanCode.MetaRight */, 'MetaRight', 57 /* KeyCode.Meta */, empty, 0, 'VK_RWIN', empty, empty],
+            [1, 165 /* ScanCode.BrightnessUp */, 'BrightnessUp', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 166 /* ScanCode.BrightnessDown */, 'BrightnessDown', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 167 /* ScanCode.MediaPlay */, 'MediaPlay', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 168 /* ScanCode.MediaRecord */, 'MediaRecord', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 169 /* ScanCode.MediaFastForward */, 'MediaFastForward', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 170 /* ScanCode.MediaRewind */, 'MediaRewind', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 171 /* ScanCode.MediaTrackNext */, 'MediaTrackNext', 124 /* KeyCode.MediaTrackNext */, 'MediaTrackNext', 176, 'VK_MEDIA_NEXT_TRACK', empty, empty],
+            [1, 172 /* ScanCode.MediaTrackPrevious */, 'MediaTrackPrevious', 125 /* KeyCode.MediaTrackPrevious */, 'MediaTrackPrevious', 177, 'VK_MEDIA_PREV_TRACK', empty, empty],
+            [1, 173 /* ScanCode.MediaStop */, 'MediaStop', 126 /* KeyCode.MediaStop */, 'MediaStop', 178, 'VK_MEDIA_STOP', empty, empty],
+            [1, 174 /* ScanCode.Eject */, 'Eject', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 175 /* ScanCode.MediaPlayPause */, 'MediaPlayPause', 127 /* KeyCode.MediaPlayPause */, 'MediaPlayPause', 179, 'VK_MEDIA_PLAY_PAUSE', empty, empty],
+            [1, 176 /* ScanCode.MediaSelect */, 'MediaSelect', 128 /* KeyCode.LaunchMediaPlayer */, 'LaunchMediaPlayer', 181, 'VK_MEDIA_LAUNCH_MEDIA_SELECT', empty, empty],
+            [1, 177 /* ScanCode.LaunchMail */, 'LaunchMail', 129 /* KeyCode.LaunchMail */, 'LaunchMail', 180, 'VK_MEDIA_LAUNCH_MAIL', empty, empty],
+            [1, 178 /* ScanCode.LaunchApp2 */, 'LaunchApp2', 130 /* KeyCode.LaunchApp2 */, 'LaunchApp2', 183, 'VK_MEDIA_LAUNCH_APP2', empty, empty],
+            [1, 179 /* ScanCode.LaunchApp1 */, 'LaunchApp1', 0 /* KeyCode.Unknown */, empty, 0, 'VK_MEDIA_LAUNCH_APP1', empty, empty],
+            [1, 180 /* ScanCode.SelectTask */, 'SelectTask', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 181 /* ScanCode.LaunchScreenSaver */, 'LaunchScreenSaver', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 182 /* ScanCode.BrowserSearch */, 'BrowserSearch', 120 /* KeyCode.BrowserSearch */, 'BrowserSearch', 170, 'VK_BROWSER_SEARCH', empty, empty],
+            [1, 183 /* ScanCode.BrowserHome */, 'BrowserHome', 121 /* KeyCode.BrowserHome */, 'BrowserHome', 172, 'VK_BROWSER_HOME', empty, empty],
+            [1, 184 /* ScanCode.BrowserBack */, 'BrowserBack', 122 /* KeyCode.BrowserBack */, 'BrowserBack', 166, 'VK_BROWSER_BACK', empty, empty],
+            [1, 185 /* ScanCode.BrowserForward */, 'BrowserForward', 123 /* KeyCode.BrowserForward */, 'BrowserForward', 167, 'VK_BROWSER_FORWARD', empty, empty],
+            [1, 186 /* ScanCode.BrowserStop */, 'BrowserStop', 0 /* KeyCode.Unknown */, empty, 0, 'VK_BROWSER_STOP', empty, empty],
+            [1, 187 /* ScanCode.BrowserRefresh */, 'BrowserRefresh', 0 /* KeyCode.Unknown */, empty, 0, 'VK_BROWSER_REFRESH', empty, empty],
+            [1, 188 /* ScanCode.BrowserFavorites */, 'BrowserFavorites', 0 /* KeyCode.Unknown */, empty, 0, 'VK_BROWSER_FAVORITES', empty, empty],
+            [1, 189 /* ScanCode.ZoomToggle */, 'ZoomToggle', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 190 /* ScanCode.MailReply */, 'MailReply', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 191 /* ScanCode.MailForward */, 'MailForward', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
+            [1, 192 /* ScanCode.MailSend */, 'MailSend', 0 /* KeyCode.Unknown */, empty, 0, empty, empty, empty],
             // See https://lists.w3.org/Archives/Public/www-dom/2010JulSep/att-0182/keyCode-spec.html
             // If an Input Method Editor is processing key input and the event is keydown, return 229.
-            [109, 1, 0 /* None */, empty, 109 /* KEY_IN_COMPOSITION */, 'KeyInComposition', 229, empty, empty, empty],
-            [111, 1, 0 /* None */, empty, 111 /* ABNT_C2 */, 'ABNT_C2', 194, 'VK_ABNT_C2', empty, empty],
-            [91, 1, 0 /* None */, empty, 91 /* OEM_8 */, 'OEM_8', 223, 'VK_OEM_8', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_CLEAR', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_KANA', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_HANGUL', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_JUNJA', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_FINAL', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_HANJA', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_KANJI', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_CONVERT', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_NONCONVERT', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_ACCEPT', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_MODECHANGE', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_SELECT', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_PRINT', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_EXECUTE', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_SNAPSHOT', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_HELP', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_APPS', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_PROCESSKEY', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_PACKET', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_DBE_SBCSCHAR', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_DBE_DBCSCHAR', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_ATTN', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_CRSEL', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_EXSEL', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_EREOF', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_PLAY', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_ZOOM', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_NONAME', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_PA1', empty, empty],
-            [0, 1, 0 /* None */, empty, 0 /* Unknown */, empty, 0, 'VK_OEM_CLEAR', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 114 /* KeyCode.KEY_IN_COMPOSITION */, 'KeyInComposition', 229, empty, empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 116 /* KeyCode.ABNT_C2 */, 'ABNT_C2', 194, 'VK_ABNT_C2', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 96 /* KeyCode.OEM_8 */, 'OEM_8', 223, 'VK_OEM_8', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_KANA', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_HANGUL', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_JUNJA', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_FINAL', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_HANJA', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_KANJI', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_CONVERT', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_NONCONVERT', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_ACCEPT', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_MODECHANGE', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_SELECT', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_PRINT', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_EXECUTE', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_SNAPSHOT', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_HELP', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_APPS', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_PROCESSKEY', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_PACKET', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_DBE_SBCSCHAR', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_DBE_DBCSCHAR', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_ATTN', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_CRSEL', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_EXSEL', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_EREOF', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_PLAY', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_ZOOM', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_NONAME', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_PA1', empty, empty],
+            [1, 0 /* ScanCode.None */, empty, 0 /* KeyCode.Unknown */, empty, 0, 'VK_OEM_CLEAR', empty, empty],
         ];
-        let seenKeyCode = [];
-        let seenScanCode = [];
+        const seenKeyCode = [];
+        const seenScanCode = [];
         for (const mapping of mappings) {
-            const [_keyCodeOrd, immutable, scanCode, scanCodeStr, keyCode, keyCodeStr, eventKeyCode, vkey, usUserSettingsLabel, generalUserSettingsLabel] = mapping;
+            const [immutable, scanCode, scanCodeStr, keyCode, keyCodeStr, eventKeyCode, vkey, usUserSettingsLabel, generalUserSettingsLabel] = mapping;
             if (!seenScanCode[scanCode]) {
                 seenScanCode[scanCode] = true;
-                scanCodeIntToStr[scanCode] = scanCodeStr;
                 scanCodeStrToInt[scanCodeStr] = scanCode;
                 scanCodeLowerCaseStrToInt[scanCodeStr.toLowerCase()] = scanCode;
-                if (immutable) {
-                    IMMUTABLE_CODE_TO_KEY_CODE[scanCode] = keyCode;
-                    if ((keyCode !== 0 /* Unknown */)
-                        && (keyCode !== 3 /* Enter */)
-                        && (keyCode !== 5 /* Ctrl */)
-                        && (keyCode !== 4 /* Shift */)
-                        && (keyCode !== 6 /* Alt */)
-                        && (keyCode !== 57 /* Meta */)) {
-                        IMMUTABLE_KEY_CODE_TO_CODE[keyCode] = scanCode;
-                    }
-                }
             }
             if (!seenKeyCode[keyCode]) {
                 seenKeyCode[keyCode] = true;
@@ -6764,12 +6877,7 @@
             if (eventKeyCode) {
                 EVENT_KEY_CODE_MAP[eventKeyCode] = keyCode;
             }
-            if (vkey) {
-                NATIVE_WINDOWS_KEY_CODE_TO_KEY_CODE[vkey] = keyCode;
-            }
         }
-        // Manually added due to the exclusion above (due to duplication with NumpadEnter)
-        IMMUTABLE_KEY_CODE_TO_CODE[3 /* Enter */] = 46 /* Enter */;
     })();
     var KeyCodeUtils;
     (function (KeyCodeUtils) {
@@ -6794,7 +6902,7 @@
         }
         KeyCodeUtils.fromUserSettings = fromUserSettings;
         function toElectronAccelerator(keyCode) {
-            if (keyCode >= 93 /* Numpad0 */ && keyCode <= 108 /* NumpadDivide */) {
+            if (keyCode >= 98 /* KeyCode.Numpad0 */ && keyCode <= 113 /* KeyCode.NumpadDivide */) {
                 // [Electron Accelerators] Electron is able to parse numpad keys, but unfortunately it
                 // renders them just as regular keys in menus. For example, num0 is rendered as "0",
                 // numdiv is rendered as "/", numsub is rendered as "-".
@@ -6806,13 +6914,13 @@
                 return null;
             }
             switch (keyCode) {
-                case 16 /* UpArrow */:
+                case 16 /* KeyCode.UpArrow */:
                     return 'Up';
-                case 18 /* DownArrow */:
+                case 18 /* KeyCode.DownArrow */:
                     return 'Down';
-                case 15 /* LeftArrow */:
+                case 15 /* KeyCode.LeftArrow */:
                     return 'Left';
-                case 17 /* RightArrow */:
+                case 17 /* KeyCode.RightArrow */:
                     return 'Right';
             }
             return uiMap.keyCodeToStr(keyCode);
@@ -6866,15 +6974,15 @@
          */
         getDirection() {
             if (this.selectionStartLineNumber === this.startLineNumber && this.selectionStartColumn === this.startColumn) {
-                return 0 /* LTR */;
+                return 0 /* SelectionDirection.LTR */;
             }
-            return 1 /* RTL */;
+            return 1 /* SelectionDirection.RTL */;
         }
         /**
          * Create a new selection with a different `positionLineNumber` and `positionColumn`.
          */
         setEndPosition(endLineNumber, endColumn) {
-            if (this.getDirection() === 0 /* LTR */) {
+            if (this.getDirection() === 0 /* SelectionDirection.LTR */) {
                 return new Selection(this.startLineNumber, this.startColumn, endLineNumber, endColumn);
             }
             return new Selection(endLineNumber, endColumn, this.startLineNumber, this.startColumn);
@@ -6895,7 +7003,7 @@
          * Create a new selection with a different `selectionStartLineNumber` and `selectionStartColumn`.
          */
         setStartPosition(startLineNumber, startColumn) {
-            if (this.getDirection() === 0 /* LTR */) {
+            if (this.getDirection() === 0 /* SelectionDirection.LTR */) {
                 return new Selection(startLineNumber, startColumn, this.endLineNumber, this.endColumn);
             }
             return new Selection(this.endLineNumber, this.endColumn, startLineNumber, startColumn);
@@ -6911,7 +7019,7 @@
          * Creates a `Selection` from a range, given a direction.
          */
         static fromRange(range, direction) {
-            if (direction === 0 /* LTR */) {
+            if (direction === 0 /* SelectionDirection.LTR */) {
                 return new Selection(range.startLineNumber, range.startColumn, range.endLineNumber, range.endColumn);
             }
             else {
@@ -6958,1492 +7066,574 @@
          * Create with a direction.
          */
         static createWithDirection(startLineNumber, startColumn, endLineNumber, endColumn, direction) {
-            if (direction === 0 /* LTR */) {
+            if (direction === 0 /* SelectionDirection.LTR */) {
                 return new Selection(startLineNumber, startColumn, endLineNumber, endColumn);
             }
             return new Selection(endLineNumber, endColumn, startLineNumber, startColumn);
         }
     }
 
-    /*---------------------------------------------------------------------------------------------
-     *  Copyright (c) Microsoft Corporation. All rights reserved.
-     *  Licensed under the MIT License. See License.txt in the project root for license information.
-     *--------------------------------------------------------------------------------------------*/
-    /**
-     * Vertical Lane in the overview ruler of the editor.
-     */
-    var OverviewRulerLane$1;
-    (function (OverviewRulerLane) {
-        OverviewRulerLane[OverviewRulerLane["Left"] = 1] = "Left";
-        OverviewRulerLane[OverviewRulerLane["Center"] = 2] = "Center";
-        OverviewRulerLane[OverviewRulerLane["Right"] = 4] = "Right";
-        OverviewRulerLane[OverviewRulerLane["Full"] = 7] = "Full";
-    })(OverviewRulerLane$1 || (OverviewRulerLane$1 = {}));
-    /**
-     * Position in the minimap to render the decoration.
-     */
-    var MinimapPosition$1;
-    (function (MinimapPosition) {
-        MinimapPosition[MinimapPosition["Inline"] = 1] = "Inline";
-        MinimapPosition[MinimapPosition["Gutter"] = 2] = "Gutter";
-    })(MinimapPosition$1 || (MinimapPosition$1 = {}));
-    var InjectedTextCursorStops$1;
-    (function (InjectedTextCursorStops) {
-        InjectedTextCursorStops[InjectedTextCursorStops["Both"] = 0] = "Both";
-        InjectedTextCursorStops[InjectedTextCursorStops["Right"] = 1] = "Right";
-        InjectedTextCursorStops[InjectedTextCursorStops["Left"] = 2] = "Left";
-        InjectedTextCursorStops[InjectedTextCursorStops["None"] = 3] = "None";
-    })(InjectedTextCursorStops$1 || (InjectedTextCursorStops$1 = {}));
-    /**
-     * @internal
-     */
-    function shouldSynchronizeModel(model) {
-        return (!model.isTooLargeForSyncing() && !model.isForSimpleWidget);
+    const _codiconFontCharacters = Object.create(null);
+    function register(id, fontCharacter) {
+        if (isString(fontCharacter)) {
+            const val = _codiconFontCharacters[fontCharacter];
+            if (val === undefined) {
+                throw new Error(`${id} references an unknown codicon: ${fontCharacter}`);
+            }
+            fontCharacter = val;
+        }
+        _codiconFontCharacters[id] = fontCharacter;
+        return { id };
     }
-
-    /*---------------------------------------------------------------------------------------------
-     *  Copyright (c) Microsoft Corporation. All rights reserved.
-     *  Licensed under the MIT License. See License.txt in the project root for license information.
-     *--------------------------------------------------------------------------------------------*/
-    var __awaiter$3 = (undefined && undefined.__awaiter) || function (thisArg, _arguments, P, generator) {
-        function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
-        return new (P || (P = Promise))(function (resolve, reject) {
-            function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
-            function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
-            function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
-            step((generator = generator.apply(thisArg, _arguments || [])).next());
-        });
+    /**
+     * The Codicon library is a set of default icons that are built-in in VS Code.
+     *
+     * In the product (outside of base) Codicons should only be used as defaults. In order to have all icons in VS Code
+     * themeable, component should define new, UI component specific icons using `iconRegistry.registerIcon`.
+     * In that call a Codicon can be named as default.
+     */
+    const Codicon = {
+        // built-in icons, with image name
+        add: register('add', 0xea60),
+        plus: register('plus', 0xea60),
+        gistNew: register('gist-new', 0xea60),
+        repoCreate: register('repo-create', 0xea60),
+        lightbulb: register('lightbulb', 0xea61),
+        lightBulb: register('light-bulb', 0xea61),
+        repo: register('repo', 0xea62),
+        repoDelete: register('repo-delete', 0xea62),
+        gistFork: register('gist-fork', 0xea63),
+        repoForked: register('repo-forked', 0xea63),
+        gitPullRequest: register('git-pull-request', 0xea64),
+        gitPullRequestAbandoned: register('git-pull-request-abandoned', 0xea64),
+        recordKeys: register('record-keys', 0xea65),
+        keyboard: register('keyboard', 0xea65),
+        tag: register('tag', 0xea66),
+        tagAdd: register('tag-add', 0xea66),
+        tagRemove: register('tag-remove', 0xea66),
+        person: register('person', 0xea67),
+        personFollow: register('person-follow', 0xea67),
+        personOutline: register('person-outline', 0xea67),
+        personFilled: register('person-filled', 0xea67),
+        gitBranch: register('git-branch', 0xea68),
+        gitBranchCreate: register('git-branch-create', 0xea68),
+        gitBranchDelete: register('git-branch-delete', 0xea68),
+        sourceControl: register('source-control', 0xea68),
+        mirror: register('mirror', 0xea69),
+        mirrorPublic: register('mirror-public', 0xea69),
+        star: register('star', 0xea6a),
+        starAdd: register('star-add', 0xea6a),
+        starDelete: register('star-delete', 0xea6a),
+        starEmpty: register('star-empty', 0xea6a),
+        comment: register('comment', 0xea6b),
+        commentAdd: register('comment-add', 0xea6b),
+        alert: register('alert', 0xea6c),
+        warning: register('warning', 0xea6c),
+        search: register('search', 0xea6d),
+        searchSave: register('search-save', 0xea6d),
+        logOut: register('log-out', 0xea6e),
+        signOut: register('sign-out', 0xea6e),
+        logIn: register('log-in', 0xea6f),
+        signIn: register('sign-in', 0xea6f),
+        eye: register('eye', 0xea70),
+        eyeUnwatch: register('eye-unwatch', 0xea70),
+        eyeWatch: register('eye-watch', 0xea70),
+        circleFilled: register('circle-filled', 0xea71),
+        primitiveDot: register('primitive-dot', 0xea71),
+        closeDirty: register('close-dirty', 0xea71),
+        debugBreakpoint: register('debug-breakpoint', 0xea71),
+        debugBreakpointDisabled: register('debug-breakpoint-disabled', 0xea71),
+        debugHint: register('debug-hint', 0xea71),
+        primitiveSquare: register('primitive-square', 0xea72),
+        edit: register('edit', 0xea73),
+        pencil: register('pencil', 0xea73),
+        info: register('info', 0xea74),
+        issueOpened: register('issue-opened', 0xea74),
+        gistPrivate: register('gist-private', 0xea75),
+        gitForkPrivate: register('git-fork-private', 0xea75),
+        lock: register('lock', 0xea75),
+        mirrorPrivate: register('mirror-private', 0xea75),
+        close: register('close', 0xea76),
+        removeClose: register('remove-close', 0xea76),
+        x: register('x', 0xea76),
+        repoSync: register('repo-sync', 0xea77),
+        sync: register('sync', 0xea77),
+        clone: register('clone', 0xea78),
+        desktopDownload: register('desktop-download', 0xea78),
+        beaker: register('beaker', 0xea79),
+        microscope: register('microscope', 0xea79),
+        vm: register('vm', 0xea7a),
+        deviceDesktop: register('device-desktop', 0xea7a),
+        file: register('file', 0xea7b),
+        fileText: register('file-text', 0xea7b),
+        more: register('more', 0xea7c),
+        ellipsis: register('ellipsis', 0xea7c),
+        kebabHorizontal: register('kebab-horizontal', 0xea7c),
+        mailReply: register('mail-reply', 0xea7d),
+        reply: register('reply', 0xea7d),
+        organization: register('organization', 0xea7e),
+        organizationFilled: register('organization-filled', 0xea7e),
+        organizationOutline: register('organization-outline', 0xea7e),
+        newFile: register('new-file', 0xea7f),
+        fileAdd: register('file-add', 0xea7f),
+        newFolder: register('new-folder', 0xea80),
+        fileDirectoryCreate: register('file-directory-create', 0xea80),
+        trash: register('trash', 0xea81),
+        trashcan: register('trashcan', 0xea81),
+        history: register('history', 0xea82),
+        clock: register('clock', 0xea82),
+        folder: register('folder', 0xea83),
+        fileDirectory: register('file-directory', 0xea83),
+        symbolFolder: register('symbol-folder', 0xea83),
+        logoGithub: register('logo-github', 0xea84),
+        markGithub: register('mark-github', 0xea84),
+        github: register('github', 0xea84),
+        terminal: register('terminal', 0xea85),
+        console: register('console', 0xea85),
+        repl: register('repl', 0xea85),
+        zap: register('zap', 0xea86),
+        symbolEvent: register('symbol-event', 0xea86),
+        error: register('error', 0xea87),
+        stop: register('stop', 0xea87),
+        variable: register('variable', 0xea88),
+        symbolVariable: register('symbol-variable', 0xea88),
+        array: register('array', 0xea8a),
+        symbolArray: register('symbol-array', 0xea8a),
+        symbolModule: register('symbol-module', 0xea8b),
+        symbolPackage: register('symbol-package', 0xea8b),
+        symbolNamespace: register('symbol-namespace', 0xea8b),
+        symbolObject: register('symbol-object', 0xea8b),
+        symbolMethod: register('symbol-method', 0xea8c),
+        symbolFunction: register('symbol-function', 0xea8c),
+        symbolConstructor: register('symbol-constructor', 0xea8c),
+        symbolBoolean: register('symbol-boolean', 0xea8f),
+        symbolNull: register('symbol-null', 0xea8f),
+        symbolNumeric: register('symbol-numeric', 0xea90),
+        symbolNumber: register('symbol-number', 0xea90),
+        symbolStructure: register('symbol-structure', 0xea91),
+        symbolStruct: register('symbol-struct', 0xea91),
+        symbolParameter: register('symbol-parameter', 0xea92),
+        symbolTypeParameter: register('symbol-type-parameter', 0xea92),
+        symbolKey: register('symbol-key', 0xea93),
+        symbolText: register('symbol-text', 0xea93),
+        symbolReference: register('symbol-reference', 0xea94),
+        goToFile: register('go-to-file', 0xea94),
+        symbolEnum: register('symbol-enum', 0xea95),
+        symbolValue: register('symbol-value', 0xea95),
+        symbolRuler: register('symbol-ruler', 0xea96),
+        symbolUnit: register('symbol-unit', 0xea96),
+        activateBreakpoints: register('activate-breakpoints', 0xea97),
+        archive: register('archive', 0xea98),
+        arrowBoth: register('arrow-both', 0xea99),
+        arrowDown: register('arrow-down', 0xea9a),
+        arrowLeft: register('arrow-left', 0xea9b),
+        arrowRight: register('arrow-right', 0xea9c),
+        arrowSmallDown: register('arrow-small-down', 0xea9d),
+        arrowSmallLeft: register('arrow-small-left', 0xea9e),
+        arrowSmallRight: register('arrow-small-right', 0xea9f),
+        arrowSmallUp: register('arrow-small-up', 0xeaa0),
+        arrowUp: register('arrow-up', 0xeaa1),
+        bell: register('bell', 0xeaa2),
+        bold: register('bold', 0xeaa3),
+        book: register('book', 0xeaa4),
+        bookmark: register('bookmark', 0xeaa5),
+        debugBreakpointConditionalUnverified: register('debug-breakpoint-conditional-unverified', 0xeaa6),
+        debugBreakpointConditional: register('debug-breakpoint-conditional', 0xeaa7),
+        debugBreakpointConditionalDisabled: register('debug-breakpoint-conditional-disabled', 0xeaa7),
+        debugBreakpointDataUnverified: register('debug-breakpoint-data-unverified', 0xeaa8),
+        debugBreakpointData: register('debug-breakpoint-data', 0xeaa9),
+        debugBreakpointDataDisabled: register('debug-breakpoint-data-disabled', 0xeaa9),
+        debugBreakpointLogUnverified: register('debug-breakpoint-log-unverified', 0xeaaa),
+        debugBreakpointLog: register('debug-breakpoint-log', 0xeaab),
+        debugBreakpointLogDisabled: register('debug-breakpoint-log-disabled', 0xeaab),
+        briefcase: register('briefcase', 0xeaac),
+        broadcast: register('broadcast', 0xeaad),
+        browser: register('browser', 0xeaae),
+        bug: register('bug', 0xeaaf),
+        calendar: register('calendar', 0xeab0),
+        caseSensitive: register('case-sensitive', 0xeab1),
+        check: register('check', 0xeab2),
+        checklist: register('checklist', 0xeab3),
+        chevronDown: register('chevron-down', 0xeab4),
+        dropDownButton: register('drop-down-button', 0xeab4),
+        chevronLeft: register('chevron-left', 0xeab5),
+        chevronRight: register('chevron-right', 0xeab6),
+        chevronUp: register('chevron-up', 0xeab7),
+        chromeClose: register('chrome-close', 0xeab8),
+        chromeMaximize: register('chrome-maximize', 0xeab9),
+        chromeMinimize: register('chrome-minimize', 0xeaba),
+        chromeRestore: register('chrome-restore', 0xeabb),
+        circle: register('circle', 0xeabc),
+        circleOutline: register('circle-outline', 0xeabc),
+        debugBreakpointUnverified: register('debug-breakpoint-unverified', 0xeabc),
+        circleSlash: register('circle-slash', 0xeabd),
+        circuitBoard: register('circuit-board', 0xeabe),
+        clearAll: register('clear-all', 0xeabf),
+        clippy: register('clippy', 0xeac0),
+        closeAll: register('close-all', 0xeac1),
+        cloudDownload: register('cloud-download', 0xeac2),
+        cloudUpload: register('cloud-upload', 0xeac3),
+        code: register('code', 0xeac4),
+        collapseAll: register('collapse-all', 0xeac5),
+        colorMode: register('color-mode', 0xeac6),
+        commentDiscussion: register('comment-discussion', 0xeac7),
+        compareChanges: register('compare-changes', 0xeafd),
+        creditCard: register('credit-card', 0xeac9),
+        dash: register('dash', 0xeacc),
+        dashboard: register('dashboard', 0xeacd),
+        database: register('database', 0xeace),
+        debugContinue: register('debug-continue', 0xeacf),
+        debugDisconnect: register('debug-disconnect', 0xead0),
+        debugPause: register('debug-pause', 0xead1),
+        debugRestart: register('debug-restart', 0xead2),
+        debugStart: register('debug-start', 0xead3),
+        debugStepInto: register('debug-step-into', 0xead4),
+        debugStepOut: register('debug-step-out', 0xead5),
+        debugStepOver: register('debug-step-over', 0xead6),
+        debugStop: register('debug-stop', 0xead7),
+        debug: register('debug', 0xead8),
+        deviceCameraVideo: register('device-camera-video', 0xead9),
+        deviceCamera: register('device-camera', 0xeada),
+        deviceMobile: register('device-mobile', 0xeadb),
+        diffAdded: register('diff-added', 0xeadc),
+        diffIgnored: register('diff-ignored', 0xeadd),
+        diffModified: register('diff-modified', 0xeade),
+        diffRemoved: register('diff-removed', 0xeadf),
+        diffRenamed: register('diff-renamed', 0xeae0),
+        diff: register('diff', 0xeae1),
+        discard: register('discard', 0xeae2),
+        editorLayout: register('editor-layout', 0xeae3),
+        emptyWindow: register('empty-window', 0xeae4),
+        exclude: register('exclude', 0xeae5),
+        extensions: register('extensions', 0xeae6),
+        eyeClosed: register('eye-closed', 0xeae7),
+        fileBinary: register('file-binary', 0xeae8),
+        fileCode: register('file-code', 0xeae9),
+        fileMedia: register('file-media', 0xeaea),
+        filePdf: register('file-pdf', 0xeaeb),
+        fileSubmodule: register('file-submodule', 0xeaec),
+        fileSymlinkDirectory: register('file-symlink-directory', 0xeaed),
+        fileSymlinkFile: register('file-symlink-file', 0xeaee),
+        fileZip: register('file-zip', 0xeaef),
+        files: register('files', 0xeaf0),
+        filter: register('filter', 0xeaf1),
+        flame: register('flame', 0xeaf2),
+        foldDown: register('fold-down', 0xeaf3),
+        foldUp: register('fold-up', 0xeaf4),
+        fold: register('fold', 0xeaf5),
+        folderActive: register('folder-active', 0xeaf6),
+        folderOpened: register('folder-opened', 0xeaf7),
+        gear: register('gear', 0xeaf8),
+        gift: register('gift', 0xeaf9),
+        gistSecret: register('gist-secret', 0xeafa),
+        gist: register('gist', 0xeafb),
+        gitCommit: register('git-commit', 0xeafc),
+        gitCompare: register('git-compare', 0xeafd),
+        gitMerge: register('git-merge', 0xeafe),
+        githubAction: register('github-action', 0xeaff),
+        githubAlt: register('github-alt', 0xeb00),
+        globe: register('globe', 0xeb01),
+        grabber: register('grabber', 0xeb02),
+        graph: register('graph', 0xeb03),
+        gripper: register('gripper', 0xeb04),
+        heart: register('heart', 0xeb05),
+        home: register('home', 0xeb06),
+        horizontalRule: register('horizontal-rule', 0xeb07),
+        hubot: register('hubot', 0xeb08),
+        inbox: register('inbox', 0xeb09),
+        issueClosed: register('issue-closed', 0xeba4),
+        issueReopened: register('issue-reopened', 0xeb0b),
+        issues: register('issues', 0xeb0c),
+        italic: register('italic', 0xeb0d),
+        jersey: register('jersey', 0xeb0e),
+        json: register('json', 0xeb0f),
+        bracket: register('bracket', 0xeb0f),
+        kebabVertical: register('kebab-vertical', 0xeb10),
+        key: register('key', 0xeb11),
+        law: register('law', 0xeb12),
+        lightbulbAutofix: register('lightbulb-autofix', 0xeb13),
+        linkExternal: register('link-external', 0xeb14),
+        link: register('link', 0xeb15),
+        listOrdered: register('list-ordered', 0xeb16),
+        listUnordered: register('list-unordered', 0xeb17),
+        liveShare: register('live-share', 0xeb18),
+        loading: register('loading', 0xeb19),
+        location: register('location', 0xeb1a),
+        mailRead: register('mail-read', 0xeb1b),
+        mail: register('mail', 0xeb1c),
+        markdown: register('markdown', 0xeb1d),
+        megaphone: register('megaphone', 0xeb1e),
+        mention: register('mention', 0xeb1f),
+        milestone: register('milestone', 0xeb20),
+        mortarBoard: register('mortar-board', 0xeb21),
+        move: register('move', 0xeb22),
+        multipleWindows: register('multiple-windows', 0xeb23),
+        mute: register('mute', 0xeb24),
+        noNewline: register('no-newline', 0xeb25),
+        note: register('note', 0xeb26),
+        octoface: register('octoface', 0xeb27),
+        openPreview: register('open-preview', 0xeb28),
+        package_: register('package', 0xeb29),
+        paintcan: register('paintcan', 0xeb2a),
+        pin: register('pin', 0xeb2b),
+        play: register('play', 0xeb2c),
+        run: register('run', 0xeb2c),
+        plug: register('plug', 0xeb2d),
+        preserveCase: register('preserve-case', 0xeb2e),
+        preview: register('preview', 0xeb2f),
+        project: register('project', 0xeb30),
+        pulse: register('pulse', 0xeb31),
+        question: register('question', 0xeb32),
+        quote: register('quote', 0xeb33),
+        radioTower: register('radio-tower', 0xeb34),
+        reactions: register('reactions', 0xeb35),
+        references: register('references', 0xeb36),
+        refresh: register('refresh', 0xeb37),
+        regex: register('regex', 0xeb38),
+        remoteExplorer: register('remote-explorer', 0xeb39),
+        remote: register('remote', 0xeb3a),
+        remove: register('remove', 0xeb3b),
+        replaceAll: register('replace-all', 0xeb3c),
+        replace: register('replace', 0xeb3d),
+        repoClone: register('repo-clone', 0xeb3e),
+        repoForcePush: register('repo-force-push', 0xeb3f),
+        repoPull: register('repo-pull', 0xeb40),
+        repoPush: register('repo-push', 0xeb41),
+        report: register('report', 0xeb42),
+        requestChanges: register('request-changes', 0xeb43),
+        rocket: register('rocket', 0xeb44),
+        rootFolderOpened: register('root-folder-opened', 0xeb45),
+        rootFolder: register('root-folder', 0xeb46),
+        rss: register('rss', 0xeb47),
+        ruby: register('ruby', 0xeb48),
+        saveAll: register('save-all', 0xeb49),
+        saveAs: register('save-as', 0xeb4a),
+        save: register('save', 0xeb4b),
+        screenFull: register('screen-full', 0xeb4c),
+        screenNormal: register('screen-normal', 0xeb4d),
+        searchStop: register('search-stop', 0xeb4e),
+        server: register('server', 0xeb50),
+        settingsGear: register('settings-gear', 0xeb51),
+        settings: register('settings', 0xeb52),
+        shield: register('shield', 0xeb53),
+        smiley: register('smiley', 0xeb54),
+        sortPrecedence: register('sort-precedence', 0xeb55),
+        splitHorizontal: register('split-horizontal', 0xeb56),
+        splitVertical: register('split-vertical', 0xeb57),
+        squirrel: register('squirrel', 0xeb58),
+        starFull: register('star-full', 0xeb59),
+        starHalf: register('star-half', 0xeb5a),
+        symbolClass: register('symbol-class', 0xeb5b),
+        symbolColor: register('symbol-color', 0xeb5c),
+        symbolCustomColor: register('symbol-customcolor', 0xeb5c),
+        symbolConstant: register('symbol-constant', 0xeb5d),
+        symbolEnumMember: register('symbol-enum-member', 0xeb5e),
+        symbolField: register('symbol-field', 0xeb5f),
+        symbolFile: register('symbol-file', 0xeb60),
+        symbolInterface: register('symbol-interface', 0xeb61),
+        symbolKeyword: register('symbol-keyword', 0xeb62),
+        symbolMisc: register('symbol-misc', 0xeb63),
+        symbolOperator: register('symbol-operator', 0xeb64),
+        symbolProperty: register('symbol-property', 0xeb65),
+        wrench: register('wrench', 0xeb65),
+        wrenchSubaction: register('wrench-subaction', 0xeb65),
+        symbolSnippet: register('symbol-snippet', 0xeb66),
+        tasklist: register('tasklist', 0xeb67),
+        telescope: register('telescope', 0xeb68),
+        textSize: register('text-size', 0xeb69),
+        threeBars: register('three-bars', 0xeb6a),
+        thumbsdown: register('thumbsdown', 0xeb6b),
+        thumbsup: register('thumbsup', 0xeb6c),
+        tools: register('tools', 0xeb6d),
+        triangleDown: register('triangle-down', 0xeb6e),
+        triangleLeft: register('triangle-left', 0xeb6f),
+        triangleRight: register('triangle-right', 0xeb70),
+        triangleUp: register('triangle-up', 0xeb71),
+        twitter: register('twitter', 0xeb72),
+        unfold: register('unfold', 0xeb73),
+        unlock: register('unlock', 0xeb74),
+        unmute: register('unmute', 0xeb75),
+        unverified: register('unverified', 0xeb76),
+        verified: register('verified', 0xeb77),
+        versions: register('versions', 0xeb78),
+        vmActive: register('vm-active', 0xeb79),
+        vmOutline: register('vm-outline', 0xeb7a),
+        vmRunning: register('vm-running', 0xeb7b),
+        watch: register('watch', 0xeb7c),
+        whitespace: register('whitespace', 0xeb7d),
+        wholeWord: register('whole-word', 0xeb7e),
+        window: register('window', 0xeb7f),
+        wordWrap: register('word-wrap', 0xeb80),
+        zoomIn: register('zoom-in', 0xeb81),
+        zoomOut: register('zoom-out', 0xeb82),
+        listFilter: register('list-filter', 0xeb83),
+        listFlat: register('list-flat', 0xeb84),
+        listSelection: register('list-selection', 0xeb85),
+        selection: register('selection', 0xeb85),
+        listTree: register('list-tree', 0xeb86),
+        debugBreakpointFunctionUnverified: register('debug-breakpoint-function-unverified', 0xeb87),
+        debugBreakpointFunction: register('debug-breakpoint-function', 0xeb88),
+        debugBreakpointFunctionDisabled: register('debug-breakpoint-function-disabled', 0xeb88),
+        debugStackframeActive: register('debug-stackframe-active', 0xeb89),
+        circleSmallFilled: register('circle-small-filled', 0xeb8a),
+        debugStackframeDot: register('debug-stackframe-dot', 0xeb8a),
+        debugStackframe: register('debug-stackframe', 0xeb8b),
+        debugStackframeFocused: register('debug-stackframe-focused', 0xeb8b),
+        debugBreakpointUnsupported: register('debug-breakpoint-unsupported', 0xeb8c),
+        symbolString: register('symbol-string', 0xeb8d),
+        debugReverseContinue: register('debug-reverse-continue', 0xeb8e),
+        debugStepBack: register('debug-step-back', 0xeb8f),
+        debugRestartFrame: register('debug-restart-frame', 0xeb90),
+        callIncoming: register('call-incoming', 0xeb92),
+        callOutgoing: register('call-outgoing', 0xeb93),
+        menu: register('menu', 0xeb94),
+        expandAll: register('expand-all', 0xeb95),
+        feedback: register('feedback', 0xeb96),
+        groupByRefType: register('group-by-ref-type', 0xeb97),
+        ungroupByRefType: register('ungroup-by-ref-type', 0xeb98),
+        account: register('account', 0xeb99),
+        bellDot: register('bell-dot', 0xeb9a),
+        debugConsole: register('debug-console', 0xeb9b),
+        library: register('library', 0xeb9c),
+        output: register('output', 0xeb9d),
+        runAll: register('run-all', 0xeb9e),
+        syncIgnored: register('sync-ignored', 0xeb9f),
+        pinned: register('pinned', 0xeba0),
+        githubInverted: register('github-inverted', 0xeba1),
+        debugAlt: register('debug-alt', 0xeb91),
+        serverProcess: register('server-process', 0xeba2),
+        serverEnvironment: register('server-environment', 0xeba3),
+        pass: register('pass', 0xeba4),
+        stopCircle: register('stop-circle', 0xeba5),
+        playCircle: register('play-circle', 0xeba6),
+        record: register('record', 0xeba7),
+        debugAltSmall: register('debug-alt-small', 0xeba8),
+        vmConnect: register('vm-connect', 0xeba9),
+        cloud: register('cloud', 0xebaa),
+        merge: register('merge', 0xebab),
+        exportIcon: register('export', 0xebac),
+        graphLeft: register('graph-left', 0xebad),
+        magnet: register('magnet', 0xebae),
+        notebook: register('notebook', 0xebaf),
+        redo: register('redo', 0xebb0),
+        checkAll: register('check-all', 0xebb1),
+        pinnedDirty: register('pinned-dirty', 0xebb2),
+        passFilled: register('pass-filled', 0xebb3),
+        circleLargeFilled: register('circle-large-filled', 0xebb4),
+        circleLarge: register('circle-large', 0xebb5),
+        circleLargeOutline: register('circle-large-outline', 0xebb5),
+        combine: register('combine', 0xebb6),
+        gather: register('gather', 0xebb6),
+        table: register('table', 0xebb7),
+        variableGroup: register('variable-group', 0xebb8),
+        typeHierarchy: register('type-hierarchy', 0xebb9),
+        typeHierarchySub: register('type-hierarchy-sub', 0xebba),
+        typeHierarchySuper: register('type-hierarchy-super', 0xebbb),
+        gitPullRequestCreate: register('git-pull-request-create', 0xebbc),
+        runAbove: register('run-above', 0xebbd),
+        runBelow: register('run-below', 0xebbe),
+        notebookTemplate: register('notebook-template', 0xebbf),
+        debugRerun: register('debug-rerun', 0xebc0),
+        workspaceTrusted: register('workspace-trusted', 0xebc1),
+        workspaceUntrusted: register('workspace-untrusted', 0xebc2),
+        workspaceUnspecified: register('workspace-unspecified', 0xebc3),
+        terminalCmd: register('terminal-cmd', 0xebc4),
+        terminalDebian: register('terminal-debian', 0xebc5),
+        terminalLinux: register('terminal-linux', 0xebc6),
+        terminalPowershell: register('terminal-powershell', 0xebc7),
+        terminalTmux: register('terminal-tmux', 0xebc8),
+        terminalUbuntu: register('terminal-ubuntu', 0xebc9),
+        terminalBash: register('terminal-bash', 0xebca),
+        arrowSwap: register('arrow-swap', 0xebcb),
+        copy: register('copy', 0xebcc),
+        personAdd: register('person-add', 0xebcd),
+        filterFilled: register('filter-filled', 0xebce),
+        wand: register('wand', 0xebcf),
+        debugLineByLine: register('debug-line-by-line', 0xebd0),
+        inspect: register('inspect', 0xebd1),
+        layers: register('layers', 0xebd2),
+        layersDot: register('layers-dot', 0xebd3),
+        layersActive: register('layers-active', 0xebd4),
+        compass: register('compass', 0xebd5),
+        compassDot: register('compass-dot', 0xebd6),
+        compassActive: register('compass-active', 0xebd7),
+        azure: register('azure', 0xebd8),
+        issueDraft: register('issue-draft', 0xebd9),
+        gitPullRequestClosed: register('git-pull-request-closed', 0xebda),
+        gitPullRequestDraft: register('git-pull-request-draft', 0xebdb),
+        debugAll: register('debug-all', 0xebdc),
+        debugCoverage: register('debug-coverage', 0xebdd),
+        runErrors: register('run-errors', 0xebde),
+        folderLibrary: register('folder-library', 0xebdf),
+        debugContinueSmall: register('debug-continue-small', 0xebe0),
+        beakerStop: register('beaker-stop', 0xebe1),
+        graphLine: register('graph-line', 0xebe2),
+        graphScatter: register('graph-scatter', 0xebe3),
+        pieChart: register('pie-chart', 0xebe4),
+        bracketDot: register('bracket-dot', 0xebe5),
+        bracketError: register('bracket-error', 0xebe6),
+        lockSmall: register('lock-small', 0xebe7),
+        azureDevops: register('azure-devops', 0xebe8),
+        verifiedFilled: register('verified-filled', 0xebe9),
+        newLine: register('newline', 0xebea),
+        layout: register('layout', 0xebeb),
+        layoutActivitybarLeft: register('layout-activitybar-left', 0xebec),
+        layoutActivitybarRight: register('layout-activitybar-right', 0xebed),
+        layoutPanelLeft: register('layout-panel-left', 0xebee),
+        layoutPanelCenter: register('layout-panel-center', 0xebef),
+        layoutPanelJustify: register('layout-panel-justify', 0xebf0),
+        layoutPanelRight: register('layout-panel-right', 0xebf1),
+        layoutPanel: register('layout-panel', 0xebf2),
+        layoutSidebarLeft: register('layout-sidebar-left', 0xebf3),
+        layoutSidebarRight: register('layout-sidebar-right', 0xebf4),
+        layoutStatusbar: register('layout-statusbar', 0xebf5),
+        layoutMenubar: register('layout-menubar', 0xebf6),
+        layoutCentered: register('layout-centered', 0xebf7),
+        layoutSidebarRightOff: register('layout-sidebar-right-off', 0xec00),
+        layoutPanelOff: register('layout-panel-off', 0xec01),
+        layoutSidebarLeftOff: register('layout-sidebar-left-off', 0xec02),
+        target: register('target', 0xebf8),
+        indent: register('indent', 0xebf9),
+        recordSmall: register('record-small', 0xebfa),
+        errorSmall: register('error-small', 0xebfb),
+        arrowCircleDown: register('arrow-circle-down', 0xebfc),
+        arrowCircleLeft: register('arrow-circle-left', 0xebfd),
+        arrowCircleRight: register('arrow-circle-right', 0xebfe),
+        arrowCircleUp: register('arrow-circle-up', 0xebff),
+        heartFilled: register('heart-filled', 0xec04),
+        map: register('map', 0xec05),
+        mapFilled: register('map-filled', 0xec06),
+        circleSmall: register('circle-small', 0xec07),
+        bellSlash: register('bell-slash', 0xec08),
+        bellSlashDot: register('bell-slash-dot', 0xec09),
+        commentUnresolved: register('comment-unresolved', 0xec0a),
+        gitPullRequestGoToChanges: register('git-pull-request-go-to-changes', 0xec0b),
+        gitPullRequestNewChanges: register('git-pull-request-new-changes', 0xec0c),
+        searchFuzzy: register('search-fuzzy', 0xec0d),
+        commentDraft: register('comment-draft', 0xec0e),
+        send: register('send', 0xec0f),
+        sparkle: register('sparkle', 0xec10),
+        insert: register('insert', 0xec11),
+        // derived icons, that could become separate icons
+        dialogError: register('dialog-error', 'error'),
+        dialogWarning: register('dialog-warning', 'warning'),
+        dialogInfo: register('dialog-info', 'info'),
+        dialogClose: register('dialog-close', 'close'),
+        treeItemExpanded: register('tree-item-expanded', 'chevron-down'),
+        treeFilterOnTypeOn: register('tree-filter-on-type-on', 'list-filter'),
+        treeFilterOnTypeOff: register('tree-filter-on-type-off', 'list-selection'),
+        treeFilterClear: register('tree-filter-clear', 'close'),
+        treeItemLoading: register('tree-item-loading', 'loading'),
+        menuSelection: register('menu-selection', 'check'),
+        menuSubmenu: register('menu-submenu', 'chevron-right'),
+        menuBarMore: register('menubar-more', 'more'),
+        scrollbarButtonLeft: register('scrollbar-button-left', 'triangle-left'),
+        scrollbarButtonRight: register('scrollbar-button-right', 'triangle-right'),
+        scrollbarButtonUp: register('scrollbar-button-up', 'triangle-up'),
+        scrollbarButtonDown: register('scrollbar-button-down', 'triangle-down'),
+        toolBarMore: register('toolbar-more', 'more'),
+        quickInputBack: register('quick-input-back', 'arrow-left')
     };
-    var __asyncValues = (undefined && undefined.__asyncValues) || function (o) {
-        if (!Symbol.asyncIterator) throw new TypeError("Symbol.asyncIterator is not defined.");
-        var m = o[Symbol.asyncIterator], i;
-        return m ? m.call(o) : (o = typeof __values === "function" ? __values(o) : o[Symbol.iterator](), i = {}, verb("next"), verb("throw"), verb("return"), i[Symbol.asyncIterator] = function () { return this; }, i);
-        function verb(n) { i[n] = o[n] && function (v) { return new Promise(function (resolve, reject) { v = o[n](v), settle(resolve, reject, v.done, v.value); }); }; }
-        function settle(resolve, reject, d, v) { Promise.resolve(v).then(function(v) { resolve({ value: v, done: d }); }, reject); }
-    };
-    function isThenable(obj) {
-        return !!obj && typeof obj.then === 'function';
-    }
-    //#endregion
-    //#region Promises
-    var Promises;
-    (function (Promises) {
-        /**
-         * A drop-in replacement for `Promise.all` with the only difference
-         * that the method awaits every promise to either fulfill or reject.
-         *
-         * Similar to `Promise.all`, only the first error will be returned
-         * if any.
-         */
-        function settled(promises) {
-            return __awaiter$3(this, void 0, void 0, function* () {
-                let firstError = undefined;
-                const result = yield Promise.all(promises.map(promise => promise.then(value => value, error => {
-                    if (!firstError) {
-                        firstError = error;
-                    }
-                    return undefined; // do not rethrow so that other promises can settle
-                })));
-                if (typeof firstError !== 'undefined') {
-                    throw firstError;
-                }
-                return result; // cast is needed and protected by the `throw` above
-            });
-        }
-        Promises.settled = settled;
-        /**
-         * A helper to create a new `Promise<T>` with a body that is a promise
-         * itself. By default, an error that raises from the async body will
-         * end up as a unhandled rejection, so this utility properly awaits the
-         * body and rejects the promise as a normal promise does without async
-         * body.
-         *
-         * This method should only be used in rare cases where otherwise `async`
-         * cannot be used (e.g. when callbacks are involved that require this).
-         */
-        function withAsyncBody(bodyFn) {
-            // eslint-disable-next-line no-async-promise-executor
-            return new Promise((resolve, reject) => __awaiter$3(this, void 0, void 0, function* () {
-                try {
-                    yield bodyFn(resolve, reject);
-                }
-                catch (error) {
-                    reject(error);
-                }
-            }));
-        }
-        Promises.withAsyncBody = withAsyncBody;
-    })(Promises || (Promises = {}));
-    /**
-     * A rich implementation for an `AsyncIterable<T>`.
-     */
-    class AsyncIterableObject {
-        constructor(executor) {
-            this._state = 0 /* Initial */;
-            this._results = [];
-            this._error = null;
-            this._onStateChanged = new Emitter();
-            queueMicrotask(() => __awaiter$3(this, void 0, void 0, function* () {
-                const writer = {
-                    emitOne: (item) => this.emitOne(item),
-                    emitMany: (items) => this.emitMany(items),
-                    reject: (error) => this.reject(error)
-                };
-                try {
-                    yield Promise.resolve(executor(writer));
-                    this.resolve();
-                }
-                catch (err) {
-                    this.reject(err);
-                }
-                finally {
-                    writer.emitOne = undefined;
-                    writer.emitMany = undefined;
-                    writer.reject = undefined;
-                }
-            }));
-        }
-        static fromArray(items) {
-            return new AsyncIterableObject((writer) => {
-                writer.emitMany(items);
-            });
-        }
-        static fromPromise(promise) {
-            return new AsyncIterableObject((emitter) => __awaiter$3(this, void 0, void 0, function* () {
-                emitter.emitMany(yield promise);
-            }));
-        }
-        static fromPromises(promises) {
-            return new AsyncIterableObject((emitter) => __awaiter$3(this, void 0, void 0, function* () {
-                yield Promise.all(promises.map((p) => __awaiter$3(this, void 0, void 0, function* () { return emitter.emitOne(yield p); })));
-            }));
-        }
-        static merge(iterables) {
-            return new AsyncIterableObject((emitter) => __awaiter$3(this, void 0, void 0, function* () {
-                yield Promise.all(iterables.map((iterable) => { var iterable_1, iterable_1_1; return __awaiter$3(this, void 0, void 0, function* () {
-                    var e_1, _a;
-                    try {
-                        for (iterable_1 = __asyncValues(iterable); iterable_1_1 = yield iterable_1.next(), !iterable_1_1.done;) {
-                            const item = iterable_1_1.value;
-                            emitter.emitOne(item);
-                        }
-                    }
-                    catch (e_1_1) { e_1 = { error: e_1_1 }; }
-                    finally {
-                        try {
-                            if (iterable_1_1 && !iterable_1_1.done && (_a = iterable_1.return)) yield _a.call(iterable_1);
-                        }
-                        finally { if (e_1) throw e_1.error; }
-                    }
-                }); }));
-            }));
-        }
-        [Symbol.asyncIterator]() {
-            let i = 0;
-            return {
-                next: () => __awaiter$3(this, void 0, void 0, function* () {
-                    do {
-                        if (this._state === 2 /* DoneError */) {
-                            throw this._error;
-                        }
-                        if (i < this._results.length) {
-                            return { done: false, value: this._results[i++] };
-                        }
-                        if (this._state === 1 /* DoneOK */) {
-                            return { done: true, value: undefined };
-                        }
-                        yield Event.toPromise(this._onStateChanged.event);
-                    } while (true);
-                })
-            };
-        }
-        static map(iterable, mapFn) {
-            return new AsyncIterableObject((emitter) => __awaiter$3(this, void 0, void 0, function* () {
-                var e_2, _a;
-                try {
-                    for (var iterable_2 = __asyncValues(iterable), iterable_2_1; iterable_2_1 = yield iterable_2.next(), !iterable_2_1.done;) {
-                        const item = iterable_2_1.value;
-                        emitter.emitOne(mapFn(item));
-                    }
-                }
-                catch (e_2_1) { e_2 = { error: e_2_1 }; }
-                finally {
-                    try {
-                        if (iterable_2_1 && !iterable_2_1.done && (_a = iterable_2.return)) yield _a.call(iterable_2);
-                    }
-                    finally { if (e_2) throw e_2.error; }
-                }
-            }));
-        }
-        map(mapFn) {
-            return AsyncIterableObject.map(this, mapFn);
-        }
-        static filter(iterable, filterFn) {
-            return new AsyncIterableObject((emitter) => __awaiter$3(this, void 0, void 0, function* () {
-                var e_3, _a;
-                try {
-                    for (var iterable_3 = __asyncValues(iterable), iterable_3_1; iterable_3_1 = yield iterable_3.next(), !iterable_3_1.done;) {
-                        const item = iterable_3_1.value;
-                        if (filterFn(item)) {
-                            emitter.emitOne(item);
-                        }
-                    }
-                }
-                catch (e_3_1) { e_3 = { error: e_3_1 }; }
-                finally {
-                    try {
-                        if (iterable_3_1 && !iterable_3_1.done && (_a = iterable_3.return)) yield _a.call(iterable_3);
-                    }
-                    finally { if (e_3) throw e_3.error; }
-                }
-            }));
-        }
-        filter(filterFn) {
-            return AsyncIterableObject.filter(this, filterFn);
-        }
-        static coalesce(iterable) {
-            return AsyncIterableObject.filter(iterable, item => !!item);
-        }
-        coalesce() {
-            return AsyncIterableObject.coalesce(this);
-        }
-        static toPromise(iterable) {
-            var iterable_4, iterable_4_1;
-            var e_4, _a;
-            return __awaiter$3(this, void 0, void 0, function* () {
-                const result = [];
-                try {
-                    for (iterable_4 = __asyncValues(iterable); iterable_4_1 = yield iterable_4.next(), !iterable_4_1.done;) {
-                        const item = iterable_4_1.value;
-                        result.push(item);
-                    }
-                }
-                catch (e_4_1) { e_4 = { error: e_4_1 }; }
-                finally {
-                    try {
-                        if (iterable_4_1 && !iterable_4_1.done && (_a = iterable_4.return)) yield _a.call(iterable_4);
-                    }
-                    finally { if (e_4) throw e_4.error; }
-                }
-                return result;
-            });
-        }
-        toPromise() {
-            return AsyncIterableObject.toPromise(this);
-        }
-        /**
-         * The value will be appended at the end.
-         *
-         * **NOTE** If `resolve()` or `reject()` have already been called, this method has no effect.
-         */
-        emitOne(value) {
-            if (this._state !== 0 /* Initial */) {
-                return;
-            }
-            // it is important to add new values at the end,
-            // as we may have iterators already running on the array
-            this._results.push(value);
-            this._onStateChanged.fire();
-        }
-        /**
-         * The values will be appended at the end.
-         *
-         * **NOTE** If `resolve()` or `reject()` have already been called, this method has no effect.
-         */
-        emitMany(values) {
-            if (this._state !== 0 /* Initial */) {
-                return;
-            }
-            // it is important to add new values at the end,
-            // as we may have iterators already running on the array
-            this._results = this._results.concat(values);
-            this._onStateChanged.fire();
-        }
-        /**
-         * Calling `resolve()` will mark the result array as complete.
-         *
-         * **NOTE** `resolve()` must be called, otherwise all consumers of this iterable will hang indefinitely, similar to a non-resolved promise.
-         * **NOTE** If `resolve()` or `reject()` have already been called, this method has no effect.
-         */
-        resolve() {
-            if (this._state !== 0 /* Initial */) {
-                return;
-            }
-            this._state = 1 /* DoneOK */;
-            this._onStateChanged.fire();
-        }
-        /**
-         * Writing an error will permanently invalidate this iterable.
-         * The current users will receive an error thrown, as will all future users.
-         *
-         * **NOTE** If `resolve()` or `reject()` have already been called, this method has no effect.
-         */
-        reject(error) {
-            if (this._state !== 0 /* Initial */) {
-                return;
-            }
-            this._state = 2 /* DoneError */;
-            this._error = error;
-            this._onStateChanged.fire();
-        }
-    }
-    AsyncIterableObject.EMPTY = AsyncIterableObject.fromArray([]);
-    //#endregion
-
-    /*---------------------------------------------------------------------------------------------
-     *  Copyright (c) Microsoft Corporation. All rights reserved.
-     *  Licensed under the MIT License. See License.txt in the project root for license information.
-     *--------------------------------------------------------------------------------------------*/
-    /**
-     * @deprecated please use `IUriIdentityService.extUri.isEqualOrParent` instead. If
-     * you are in a context without services, consider to pass down the `extUri` from the
-     * outside, or use `extUriBiasedIgnorePathCase` if you know what you are doing.
-     */
-    function isEqualOrParent(base, parentCandidate, ignoreCase, separator = sep) {
-        if (base === parentCandidate) {
-            return true;
-        }
-        if (!base || !parentCandidate) {
-            return false;
-        }
-        if (parentCandidate.length > base.length) {
-            return false;
-        }
-        if (ignoreCase) {
-            const beginsWith = startsWithIgnoreCase(base, parentCandidate);
-            if (!beginsWith) {
-                return false;
-            }
-            if (parentCandidate.length === base.length) {
-                return true; // same path, different casing
-            }
-            let sepOffset = parentCandidate.length;
-            if (parentCandidate.charAt(parentCandidate.length - 1) === separator) {
-                sepOffset--; // adjust the expected sep offset in case our candidate already ends in separator character
-            }
-            return base.charAt(sepOffset) === separator;
-        }
-        if (parentCandidate.charAt(parentCandidate.length - 1) !== separator) {
-            parentCandidate += separator;
-        }
-        return base.indexOf(parentCandidate) === 0;
-    }
-
-    var _b;
-    class LinkedMap {
-        constructor() {
-            this[_b] = 'LinkedMap';
-            this._map = new Map();
-            this._head = undefined;
-            this._tail = undefined;
-            this._size = 0;
-            this._state = 0;
-        }
-        clear() {
-            this._map.clear();
-            this._head = undefined;
-            this._tail = undefined;
-            this._size = 0;
-            this._state++;
-        }
-        isEmpty() {
-            return !this._head && !this._tail;
-        }
-        get size() {
-            return this._size;
-        }
-        get first() {
-            var _c;
-            return (_c = this._head) === null || _c === void 0 ? void 0 : _c.value;
-        }
-        get last() {
-            var _c;
-            return (_c = this._tail) === null || _c === void 0 ? void 0 : _c.value;
-        }
-        has(key) {
-            return this._map.has(key);
-        }
-        get(key, touch = 0 /* None */) {
-            const item = this._map.get(key);
-            if (!item) {
-                return undefined;
-            }
-            if (touch !== 0 /* None */) {
-                this.touch(item, touch);
-            }
-            return item.value;
-        }
-        set(key, value, touch = 0 /* None */) {
-            let item = this._map.get(key);
-            if (item) {
-                item.value = value;
-                if (touch !== 0 /* None */) {
-                    this.touch(item, touch);
-                }
-            }
-            else {
-                item = { key, value, next: undefined, previous: undefined };
-                switch (touch) {
-                    case 0 /* None */:
-                        this.addItemLast(item);
-                        break;
-                    case 1 /* AsOld */:
-                        this.addItemFirst(item);
-                        break;
-                    case 2 /* AsNew */:
-                        this.addItemLast(item);
-                        break;
-                    default:
-                        this.addItemLast(item);
-                        break;
-                }
-                this._map.set(key, item);
-                this._size++;
-            }
-            return this;
-        }
-        delete(key) {
-            return !!this.remove(key);
-        }
-        remove(key) {
-            const item = this._map.get(key);
-            if (!item) {
-                return undefined;
-            }
-            this._map.delete(key);
-            this.removeItem(item);
-            this._size--;
-            return item.value;
-        }
-        shift() {
-            if (!this._head && !this._tail) {
-                return undefined;
-            }
-            if (!this._head || !this._tail) {
-                throw new Error('Invalid list');
-            }
-            const item = this._head;
-            this._map.delete(item.key);
-            this.removeItem(item);
-            this._size--;
-            return item.value;
-        }
-        forEach(callbackfn, thisArg) {
-            const state = this._state;
-            let current = this._head;
-            while (current) {
-                if (thisArg) {
-                    callbackfn.bind(thisArg)(current.value, current.key, this);
-                }
-                else {
-                    callbackfn(current.value, current.key, this);
-                }
-                if (this._state !== state) {
-                    throw new Error(`LinkedMap got modified during iteration.`);
-                }
-                current = current.next;
-            }
-        }
-        keys() {
-            const map = this;
-            const state = this._state;
-            let current = this._head;
-            const iterator = {
-                [Symbol.iterator]() {
-                    return iterator;
-                },
-                next() {
-                    if (map._state !== state) {
-                        throw new Error(`LinkedMap got modified during iteration.`);
-                    }
-                    if (current) {
-                        const result = { value: current.key, done: false };
-                        current = current.next;
-                        return result;
-                    }
-                    else {
-                        return { value: undefined, done: true };
-                    }
-                }
-            };
-            return iterator;
-        }
-        values() {
-            const map = this;
-            const state = this._state;
-            let current = this._head;
-            const iterator = {
-                [Symbol.iterator]() {
-                    return iterator;
-                },
-                next() {
-                    if (map._state !== state) {
-                        throw new Error(`LinkedMap got modified during iteration.`);
-                    }
-                    if (current) {
-                        const result = { value: current.value, done: false };
-                        current = current.next;
-                        return result;
-                    }
-                    else {
-                        return { value: undefined, done: true };
-                    }
-                }
-            };
-            return iterator;
-        }
-        entries() {
-            const map = this;
-            const state = this._state;
-            let current = this._head;
-            const iterator = {
-                [Symbol.iterator]() {
-                    return iterator;
-                },
-                next() {
-                    if (map._state !== state) {
-                        throw new Error(`LinkedMap got modified during iteration.`);
-                    }
-                    if (current) {
-                        const result = { value: [current.key, current.value], done: false };
-                        current = current.next;
-                        return result;
-                    }
-                    else {
-                        return { value: undefined, done: true };
-                    }
-                }
-            };
-            return iterator;
-        }
-        [(_b = Symbol.toStringTag, Symbol.iterator)]() {
-            return this.entries();
-        }
-        trimOld(newSize) {
-            if (newSize >= this.size) {
-                return;
-            }
-            if (newSize === 0) {
-                this.clear();
-                return;
-            }
-            let current = this._head;
-            let currentSize = this.size;
-            while (current && currentSize > newSize) {
-                this._map.delete(current.key);
-                current = current.next;
-                currentSize--;
-            }
-            this._head = current;
-            this._size = currentSize;
-            if (current) {
-                current.previous = undefined;
-            }
-            this._state++;
-        }
-        addItemFirst(item) {
-            // First time Insert
-            if (!this._head && !this._tail) {
-                this._tail = item;
-            }
-            else if (!this._head) {
-                throw new Error('Invalid list');
-            }
-            else {
-                item.next = this._head;
-                this._head.previous = item;
-            }
-            this._head = item;
-            this._state++;
-        }
-        addItemLast(item) {
-            // First time Insert
-            if (!this._head && !this._tail) {
-                this._head = item;
-            }
-            else if (!this._tail) {
-                throw new Error('Invalid list');
-            }
-            else {
-                item.previous = this._tail;
-                this._tail.next = item;
-            }
-            this._tail = item;
-            this._state++;
-        }
-        removeItem(item) {
-            if (item === this._head && item === this._tail) {
-                this._head = undefined;
-                this._tail = undefined;
-            }
-            else if (item === this._head) {
-                // This can only happen if size === 1 which is handled
-                // by the case above.
-                if (!item.next) {
-                    throw new Error('Invalid list');
-                }
-                item.next.previous = undefined;
-                this._head = item.next;
-            }
-            else if (item === this._tail) {
-                // This can only happen if size === 1 which is handled
-                // by the case above.
-                if (!item.previous) {
-                    throw new Error('Invalid list');
-                }
-                item.previous.next = undefined;
-                this._tail = item.previous;
-            }
-            else {
-                const next = item.next;
-                const previous = item.previous;
-                if (!next || !previous) {
-                    throw new Error('Invalid list');
-                }
-                next.previous = previous;
-                previous.next = next;
-            }
-            item.next = undefined;
-            item.previous = undefined;
-            this._state++;
-        }
-        touch(item, touch) {
-            if (!this._head || !this._tail) {
-                throw new Error('Invalid list');
-            }
-            if ((touch !== 1 /* AsOld */ && touch !== 2 /* AsNew */)) {
-                return;
-            }
-            if (touch === 1 /* AsOld */) {
-                if (item === this._head) {
-                    return;
-                }
-                const next = item.next;
-                const previous = item.previous;
-                // Unlink the item
-                if (item === this._tail) {
-                    // previous must be defined since item was not head but is tail
-                    // So there are more than on item in the map
-                    previous.next = undefined;
-                    this._tail = previous;
-                }
-                else {
-                    // Both next and previous are not undefined since item was neither head nor tail.
-                    next.previous = previous;
-                    previous.next = next;
-                }
-                // Insert the node at head
-                item.previous = undefined;
-                item.next = this._head;
-                this._head.previous = item;
-                this._head = item;
-                this._state++;
-            }
-            else if (touch === 2 /* AsNew */) {
-                if (item === this._tail) {
-                    return;
-                }
-                const next = item.next;
-                const previous = item.previous;
-                // Unlink the item.
-                if (item === this._head) {
-                    // next must be defined since item was not tail but is head
-                    // So there are more than on item in the map
-                    next.previous = undefined;
-                    this._head = next;
-                }
-                else {
-                    // Both next and previous are not undefined since item was neither head nor tail.
-                    next.previous = previous;
-                    previous.next = next;
-                }
-                item.next = undefined;
-                item.previous = this._tail;
-                this._tail.next = item;
-                this._tail = item;
-                this._state++;
-            }
-        }
-        toJSON() {
-            const data = [];
-            this.forEach((value, key) => {
-                data.push([key, value]);
-            });
-            return data;
-        }
-        fromJSON(data) {
-            this.clear();
-            for (const [key, value] of data) {
-                this.set(key, value);
-            }
-        }
-    }
-    class LRUCache extends LinkedMap {
-        constructor(limit, ratio = 1) {
-            super();
-            this._limit = limit;
-            this._ratio = Math.min(Math.max(0, ratio), 1);
-        }
-        get limit() {
-            return this._limit;
-        }
-        set limit(limit) {
-            this._limit = limit;
-            this.checkTrim();
-        }
-        get(key, touch = 2 /* AsNew */) {
-            return super.get(key, touch);
-        }
-        peek(key) {
-            return super.get(key, 0 /* None */);
-        }
-        set(key, value) {
-            super.set(key, value, 2 /* AsNew */);
-            this.checkTrim();
-            return this;
-        }
-        checkTrim() {
-            if (this.size > this._limit) {
-                this.trimOld(Math.round(this._limit * this._ratio));
-            }
-        }
-    }
-
-    /*---------------------------------------------------------------------------------------------
-     *  Copyright (c) Microsoft Corporation. All rights reserved.
-     *  Licensed under the MIT License. See License.txt in the project root for license information.
-     *--------------------------------------------------------------------------------------------*/
-    const GLOBSTAR = '**';
-    const GLOB_SPLIT = '/';
-    const PATH_REGEX = '[/\\\\]'; // any slash or backslash
-    const NO_PATH_REGEX = '[^/\\\\]'; // any non-slash and non-backslash
-    const ALL_FORWARD_SLASHES = /\//g;
-    function starsToRegExp(starCount) {
-        switch (starCount) {
-            case 0:
-                return '';
-            case 1:
-                return `${NO_PATH_REGEX}*?`; // 1 star matches any number of characters except path separator (/ and \) - non greedy (?)
-            default:
-                // Matches:  (Path Sep OR Path Val followed by Path Sep OR Path Sep followed by Path Val) 0-many times
-                // Group is non capturing because we don't need to capture at all (?:...)
-                // Overall we use non-greedy matching because it could be that we match too much
-                return `(?:${PATH_REGEX}|${NO_PATH_REGEX}+${PATH_REGEX}|${PATH_REGEX}${NO_PATH_REGEX}+)*?`;
-        }
-    }
-    function splitGlobAware(pattern, splitChar) {
-        if (!pattern) {
-            return [];
-        }
-        const segments = [];
-        let inBraces = false;
-        let inBrackets = false;
-        let curVal = '';
-        for (const char of pattern) {
-            switch (char) {
-                case splitChar:
-                    if (!inBraces && !inBrackets) {
-                        segments.push(curVal);
-                        curVal = '';
-                        continue;
-                    }
-                    break;
-                case '{':
-                    inBraces = true;
-                    break;
-                case '}':
-                    inBraces = false;
-                    break;
-                case '[':
-                    inBrackets = true;
-                    break;
-                case ']':
-                    inBrackets = false;
-                    break;
-            }
-            curVal += char;
-        }
-        // Tail
-        if (curVal) {
-            segments.push(curVal);
-        }
-        return segments;
-    }
-    function parseRegExp(pattern) {
-        if (!pattern) {
-            return '';
-        }
-        let regEx = '';
-        // Split up into segments for each slash found
-        const segments = splitGlobAware(pattern, GLOB_SPLIT);
-        // Special case where we only have globstars
-        if (segments.every(s => s === GLOBSTAR)) {
-            regEx = '.*';
-        }
-        // Build regex over segments
-        else {
-            let previousSegmentWasGlobStar = false;
-            segments.forEach((segment, index) => {
-                // Globstar is special
-                if (segment === GLOBSTAR) {
-                    // if we have more than one globstar after another, just ignore it
-                    if (!previousSegmentWasGlobStar) {
-                        regEx += starsToRegExp(2);
-                        previousSegmentWasGlobStar = true;
-                    }
-                    return;
-                }
-                // States
-                let inBraces = false;
-                let braceVal = '';
-                let inBrackets = false;
-                let bracketVal = '';
-                for (const char of segment) {
-                    // Support brace expansion
-                    if (char !== '}' && inBraces) {
-                        braceVal += char;
-                        continue;
-                    }
-                    // Support brackets
-                    if (inBrackets && (char !== ']' || !bracketVal) /* ] is literally only allowed as first character in brackets to match it */) {
-                        let res;
-                        // range operator
-                        if (char === '-') {
-                            res = char;
-                        }
-                        // negation operator (only valid on first index in bracket)
-                        else if ((char === '^' || char === '!') && !bracketVal) {
-                            res = '^';
-                        }
-                        // glob split matching is not allowed within character ranges
-                        // see http://man7.org/linux/man-pages/man7/glob.7.html
-                        else if (char === GLOB_SPLIT) {
-                            res = '';
-                        }
-                        // anything else gets escaped
-                        else {
-                            res = escapeRegExpCharacters(char);
-                        }
-                        bracketVal += res;
-                        continue;
-                    }
-                    switch (char) {
-                        case '{':
-                            inBraces = true;
-                            continue;
-                        case '[':
-                            inBrackets = true;
-                            continue;
-                        case '}': {
-                            const choices = splitGlobAware(braceVal, ',');
-                            // Converts {foo,bar} => [foo|bar]
-                            const braceRegExp = `(?:${choices.map(c => parseRegExp(c)).join('|')})`;
-                            regEx += braceRegExp;
-                            inBraces = false;
-                            braceVal = '';
-                            break;
-                        }
-                        case ']':
-                            regEx += ('[' + bracketVal + ']');
-                            inBrackets = false;
-                            bracketVal = '';
-                            break;
-                        case '?':
-                            regEx += NO_PATH_REGEX; // 1 ? matches any single character except path separator (/ and \)
-                            continue;
-                        case '*':
-                            regEx += starsToRegExp(1);
-                            continue;
-                        default:
-                            regEx += escapeRegExpCharacters(char);
-                    }
-                }
-                // Tail: Add the slash we had split on if there is more to come and the remaining pattern is not a globstar
-                // For example if pattern: some/**/*.js we want the "/" after some to be included in the RegEx to prevent
-                // a folder called "something" to match as well.
-                // However, if pattern: some/**, we tolerate that we also match on "something" because our globstar behaviour
-                // is to match 0-N segments.
-                if (index < segments.length - 1 && (segments[index + 1] !== GLOBSTAR || index + 2 < segments.length)) {
-                    regEx += PATH_REGEX;
-                }
-                // reset state
-                previousSegmentWasGlobStar = false;
-            });
-        }
-        return regEx;
-    }
-    // regexes to check for trivial glob patterns that just check for String#endsWith
-    const T1 = /^\*\*\/\*\.[\w\.-]+$/; // **/*.something
-    const T2 = /^\*\*\/([\w\.-]+)\/?$/; // **/something
-    const T3 = /^{\*\*\/[\*\.]?[\w\.-]+\/?(,\*\*\/[\*\.]?[\w\.-]+\/?)*}$/; // {**/*.something,**/*.else} or {**/package.json,**/project.json}
-    const T3_2 = /^{\*\*\/[\*\.]?[\w\.-]+(\/(\*\*)?)?(,\*\*\/[\*\.]?[\w\.-]+(\/(\*\*)?)?)*}$/; // Like T3, with optional trailing /**
-    const T4 = /^\*\*((\/[\w\.-]+)+)\/?$/; // **/something/else
-    const T5 = /^([\w\.-]+(\/[\w\.-]+)*)\/?$/; // something/else
-    const CACHE = new LRUCache(10000); // bounded to 10000 elements
-    const FALSE = function () {
-        return false;
-    };
-    const NULL = function () {
-        return null;
-    };
-    function parsePattern(arg1, options) {
-        if (!arg1) {
-            return NULL;
-        }
-        // Handle IRelativePattern
-        let pattern;
-        if (typeof arg1 !== 'string') {
-            pattern = arg1.pattern;
-        }
-        else {
-            pattern = arg1;
-        }
-        // Whitespace trimming
-        pattern = pattern.trim();
-        // Check cache
-        const patternKey = `${pattern}_${!!options.trimForExclusions}`;
-        let parsedPattern = CACHE.get(patternKey);
-        if (parsedPattern) {
-            return wrapRelativePattern(parsedPattern, arg1);
-        }
-        // Check for Trivials
-        let match;
-        if (T1.test(pattern)) { // common pattern: **/*.txt just need endsWith check
-            const base = pattern.substr(4); // '**/*'.length === 4
-            parsedPattern = function (path, basename) {
-                return typeof path === 'string' && path.endsWith(base) ? pattern : null;
-            };
-        }
-        else if (match = T2.exec(trimForExclusions(pattern, options))) { // common pattern: **/some.txt just need basename check
-            parsedPattern = trivia2(match[1], pattern);
-        }
-        else if ((options.trimForExclusions ? T3_2 : T3).test(pattern)) { // repetition of common patterns (see above) {**/*.txt,**/*.png}
-            parsedPattern = trivia3(pattern, options);
-        }
-        else if (match = T4.exec(trimForExclusions(pattern, options))) { // common pattern: **/something/else just need endsWith check
-            parsedPattern = trivia4and5(match[1].substr(1), pattern, true);
-        }
-        else if (match = T5.exec(trimForExclusions(pattern, options))) { // common pattern: something/else just need equals check
-            parsedPattern = trivia4and5(match[1], pattern, false);
-        }
-        // Otherwise convert to pattern
-        else {
-            parsedPattern = toRegExp(pattern);
-        }
-        // Cache
-        CACHE.set(patternKey, parsedPattern);
-        return wrapRelativePattern(parsedPattern, arg1);
-    }
-    function wrapRelativePattern(parsedPattern, arg2) {
-        if (typeof arg2 === 'string') {
-            return parsedPattern;
-        }
-        return function (path, basename) {
-            if (!isEqualOrParent(path, arg2.base, !isLinux)) {
-                // skip glob matching if `base` is not a parent of `path`
-                return null;
-            }
-            // Given we have checked `base` being a parent of `path`,
-            // we can now remove the `base` portion of the `path`
-            // and only match on the remaining path components
-            return parsedPattern(path.substr(arg2.base.length + 1), basename);
-        };
-    }
-    function trimForExclusions(pattern, options) {
-        return options.trimForExclusions && pattern.endsWith('/**') ? pattern.substr(0, pattern.length - 2) : pattern; // dropping **, tailing / is dropped later
-    }
-    // common pattern: **/some.txt just need basename check
-    function trivia2(base, originalPattern) {
-        const slashBase = `/${base}`;
-        const backslashBase = `\\${base}`;
-        const parsedPattern = function (path, basename) {
-            if (typeof path !== 'string') {
-                return null;
-            }
-            if (basename) {
-                return basename === base ? originalPattern : null;
-            }
-            return path === base || path.endsWith(slashBase) || path.endsWith(backslashBase) ? originalPattern : null;
-        };
-        const basenames = [base];
-        parsedPattern.basenames = basenames;
-        parsedPattern.patterns = [originalPattern];
-        parsedPattern.allBasenames = basenames;
-        return parsedPattern;
-    }
-    // repetition of common patterns (see above) {**/*.txt,**/*.png}
-    function trivia3(pattern, options) {
-        const parsedPatterns = aggregateBasenameMatches(pattern.slice(1, -1).split(',')
-            .map(pattern => parsePattern(pattern, options))
-            .filter(pattern => pattern !== NULL), pattern);
-        const n = parsedPatterns.length;
-        if (!n) {
-            return NULL;
-        }
-        if (n === 1) {
-            return parsedPatterns[0];
-        }
-        const parsedPattern = function (path, basename) {
-            for (let i = 0, n = parsedPatterns.length; i < n; i++) {
-                if (parsedPatterns[i](path, basename)) {
-                    return pattern;
-                }
-            }
-            return null;
-        };
-        const withBasenames = parsedPatterns.find(pattern => !!pattern.allBasenames);
-        if (withBasenames) {
-            parsedPattern.allBasenames = withBasenames.allBasenames;
-        }
-        const allPaths = parsedPatterns.reduce((all, current) => current.allPaths ? all.concat(current.allPaths) : all, []);
-        if (allPaths.length) {
-            parsedPattern.allPaths = allPaths;
-        }
-        return parsedPattern;
-    }
-    // common patterns: **/something/else just need endsWith check, something/else just needs and equals check
-    function trivia4and5(targetPath, pattern, matchPathEnds) {
-        const usingPosixSep = sep === posix.sep;
-        const nativePath = usingPosixSep ? targetPath : targetPath.replace(ALL_FORWARD_SLASHES, sep);
-        const nativePathEnd = sep + nativePath;
-        const targetPathEnd = posix.sep + targetPath;
-        const parsedPattern = matchPathEnds ? function (testPath, basename) {
-            return typeof testPath === 'string' &&
-                ((testPath === nativePath || testPath.endsWith(nativePathEnd))
-                    || !usingPosixSep && (testPath === targetPath || testPath.endsWith(targetPathEnd)))
-                ? pattern : null;
-        } : function (testPath, basename) {
-            return typeof testPath === 'string' &&
-                (testPath === nativePath
-                    || (!usingPosixSep && testPath === targetPath))
-                ? pattern : null;
-        };
-        parsedPattern.allPaths = [(matchPathEnds ? '*/' : './') + targetPath];
-        return parsedPattern;
-    }
-    function toRegExp(pattern) {
-        try {
-            const regExp = new RegExp(`^${parseRegExp(pattern)}$`);
-            return function (path) {
-                regExp.lastIndex = 0; // reset RegExp to its initial state to reuse it!
-                return typeof path === 'string' && regExp.test(path) ? pattern : null;
-            };
-        }
-        catch (error) {
-            return NULL;
-        }
-    }
-    function match(arg1, path, hasSibling) {
-        if (!arg1 || typeof path !== 'string') {
-            return false;
-        }
-        return parse$1(arg1)(path, undefined, hasSibling);
-    }
-    function parse$1(arg1, options = {}) {
-        if (!arg1) {
-            return FALSE;
-        }
-        // Glob with String
-        if (typeof arg1 === 'string' || isRelativePattern(arg1)) {
-            const parsedPattern = parsePattern(arg1, options);
-            if (parsedPattern === NULL) {
-                return FALSE;
-            }
-            const resultPattern = function (path, basename) {
-                return !!parsedPattern(path, basename);
-            };
-            if (parsedPattern.allBasenames) {
-                resultPattern.allBasenames = parsedPattern.allBasenames;
-            }
-            if (parsedPattern.allPaths) {
-                resultPattern.allPaths = parsedPattern.allPaths;
-            }
-            return resultPattern;
-        }
-        // Glob with Expression
-        return parsedExpression(arg1, options);
-    }
-    function isRelativePattern(obj) {
-        const rp = obj;
-        if (!rp) {
-            return false;
-        }
-        return typeof rp.base === 'string' && typeof rp.pattern === 'string';
-    }
-    function parsedExpression(expression, options) {
-        const parsedPatterns = aggregateBasenameMatches(Object.getOwnPropertyNames(expression)
-            .map(pattern => parseExpressionPattern(pattern, expression[pattern], options))
-            .filter(pattern => pattern !== NULL));
-        const n = parsedPatterns.length;
-        if (!n) {
-            return NULL;
-        }
-        if (!parsedPatterns.some(parsedPattern => !!parsedPattern.requiresSiblings)) {
-            if (n === 1) {
-                return parsedPatterns[0];
-            }
-            const resultExpression = function (path, basename) {
-                for (let i = 0, n = parsedPatterns.length; i < n; i++) {
-                    // Pattern matches path
-                    const result = parsedPatterns[i](path, basename);
-                    if (result) {
-                        return result;
-                    }
-                }
-                return null;
-            };
-            const withBasenames = parsedPatterns.find(pattern => !!pattern.allBasenames);
-            if (withBasenames) {
-                resultExpression.allBasenames = withBasenames.allBasenames;
-            }
-            const allPaths = parsedPatterns.reduce((all, current) => current.allPaths ? all.concat(current.allPaths) : all, []);
-            if (allPaths.length) {
-                resultExpression.allPaths = allPaths;
-            }
-            return resultExpression;
-        }
-        const resultExpression = function (path, base, hasSibling) {
-            let name = undefined;
-            for (let i = 0, n = parsedPatterns.length; i < n; i++) {
-                // Pattern matches path
-                const parsedPattern = parsedPatterns[i];
-                if (parsedPattern.requiresSiblings && hasSibling) {
-                    if (!base) {
-                        base = basename(path);
-                    }
-                    if (!name) {
-                        name = base.substr(0, base.length - extname(path).length);
-                    }
-                }
-                const result = parsedPattern(path, base, name, hasSibling);
-                if (result) {
-                    return result;
-                }
-            }
-            return null;
-        };
-        const withBasenames = parsedPatterns.find(pattern => !!pattern.allBasenames);
-        if (withBasenames) {
-            resultExpression.allBasenames = withBasenames.allBasenames;
-        }
-        const allPaths = parsedPatterns.reduce((all, current) => current.allPaths ? all.concat(current.allPaths) : all, []);
-        if (allPaths.length) {
-            resultExpression.allPaths = allPaths;
-        }
-        return resultExpression;
-    }
-    function parseExpressionPattern(pattern, value, options) {
-        if (value === false) {
-            return NULL; // pattern is disabled
-        }
-        const parsedPattern = parsePattern(pattern, options);
-        if (parsedPattern === NULL) {
-            return NULL;
-        }
-        // Expression Pattern is <boolean>
-        if (typeof value === 'boolean') {
-            return parsedPattern;
-        }
-        // Expression Pattern is <SiblingClause>
-        if (value) {
-            const when = value.when;
-            if (typeof when === 'string') {
-                const result = (path, basename, name, hasSibling) => {
-                    if (!hasSibling || !parsedPattern(path, basename)) {
-                        return null;
-                    }
-                    const clausePattern = when.replace('$(basename)', name);
-                    const matched = hasSibling(clausePattern);
-                    return isThenable(matched) ?
-                        matched.then(m => m ? pattern : null) :
-                        matched ? pattern : null;
-                };
-                result.requiresSiblings = true;
-                return result;
-            }
-        }
-        // Expression is Anything
-        return parsedPattern;
-    }
-    function aggregateBasenameMatches(parsedPatterns, result) {
-        const basenamePatterns = parsedPatterns.filter(parsedPattern => !!parsedPattern.basenames);
-        if (basenamePatterns.length < 2) {
-            return parsedPatterns;
-        }
-        const basenames = basenamePatterns.reduce((all, current) => {
-            const basenames = current.basenames;
-            return basenames ? all.concat(basenames) : all;
-        }, []);
-        let patterns;
-        if (result) {
-            patterns = [];
-            for (let i = 0, n = basenames.length; i < n; i++) {
-                patterns.push(result);
-            }
-        }
-        else {
-            patterns = basenamePatterns.reduce((all, current) => {
-                const patterns = current.patterns;
-                return patterns ? all.concat(patterns) : all;
-            }, []);
-        }
-        const aggregate = function (path, basename) {
-            if (typeof path !== 'string') {
-                return null;
-            }
-            if (!basename) {
-                let i;
-                for (i = path.length; i > 0; i--) {
-                    const ch = path.charCodeAt(i - 1);
-                    if (ch === 47 /* Slash */ || ch === 92 /* Backslash */) {
-                        break;
-                    }
-                }
-                basename = path.substr(i);
-            }
-            const index = basenames.indexOf(basename);
-            return index !== -1 ? patterns[index] : null;
-        };
-        aggregate.basenames = basenames;
-        aggregate.patterns = patterns;
-        aggregate.allBasenames = basenames;
-        const aggregatedPatterns = parsedPatterns.filter(parsedPattern => !parsedPattern.basenames);
-        aggregatedPatterns.push(aggregate);
-        return aggregatedPatterns;
-    }
-
-    /*---------------------------------------------------------------------------------------------
-     *  Copyright (c) Microsoft Corporation. All rights reserved.
-     *  Licensed under the MIT License. See License.txt in the project root for license information.
-     *--------------------------------------------------------------------------------------------*/
-    function score(selector, candidateUri, candidateLanguage, candidateIsSynchronized) {
-        if (Array.isArray(selector)) {
-            // array -> take max individual value
-            let ret = 0;
-            for (const filter of selector) {
-                const value = score(filter, candidateUri, candidateLanguage, candidateIsSynchronized);
-                if (value === 10) {
-                    return value; // already at the highest
-                }
-                if (value > ret) {
-                    ret = value;
-                }
-            }
-            return ret;
-        }
-        else if (typeof selector === 'string') {
-            if (!candidateIsSynchronized) {
-                return 0;
-            }
-            // short-hand notion, desugars to
-            // 'fooLang' -> { language: 'fooLang'}
-            // '*' -> { language: '*' }
-            if (selector === '*') {
-                return 5;
-            }
-            else if (selector === candidateLanguage) {
-                return 10;
-            }
-            else {
-                return 0;
-            }
-        }
-        else if (selector) {
-            // filter -> select accordingly, use defaults for scheme
-            const { language, pattern, scheme, hasAccessToAllModels } = selector; // TODO: microsoft/TypeScript#42768
-            if (!candidateIsSynchronized && !hasAccessToAllModels) {
-                return 0;
-            }
-            let ret = 0;
-            if (scheme) {
-                if (scheme === candidateUri.scheme) {
-                    ret = 10;
-                }
-                else if (scheme === '*') {
-                    ret = 5;
-                }
-                else {
-                    return 0;
-                }
-            }
-            if (language) {
-                if (language === candidateLanguage) {
-                    ret = 10;
-                }
-                else if (language === '*') {
-                    ret = Math.max(ret, 5);
-                }
-                else {
-                    return 0;
-                }
-            }
-            if (pattern) {
-                let normalizedPattern;
-                if (typeof pattern === 'string') {
-                    normalizedPattern = pattern;
-                }
-                else {
-                    // Since this pattern has a `base` property, we need
-                    // to normalize this path first before passing it on
-                    // because we will compare it against `Uri.fsPath`
-                    // which uses platform specific separators.
-                    // Refs: https://github.com/microsoft/vscode/issues/99938
-                    normalizedPattern = Object.assign(Object.assign({}, pattern), { base: normalize(pattern.base) });
-                }
-                if (normalizedPattern === candidateUri.fsPath || match(normalizedPattern, candidateUri.fsPath)) {
-                    ret = 10;
-                }
-                else {
-                    return 0;
-                }
-            }
-            return ret;
-        }
-        else {
-            return 0;
-        }
-    }
-
-    /*---------------------------------------------------------------------------------------------
-     *  Copyright (c) Microsoft Corporation. All rights reserved.
-     *  Licensed under the MIT License. See License.txt in the project root for license information.
-     *--------------------------------------------------------------------------------------------*/
-    function isExclusive(selector) {
-        if (typeof selector === 'string') {
-            return false;
-        }
-        else if (Array.isArray(selector)) {
-            return selector.every(isExclusive);
-        }
-        else {
-            return !!selector.exclusive; // TODO: microsoft/TypeScript#42768
-        }
-    }
-    class LanguageFeatureRegistry {
-        constructor() {
-            this._clock = 0;
-            this._entries = [];
-            this._onDidChange = new Emitter();
-        }
-        get onDidChange() {
-            return this._onDidChange.event;
-        }
-        register(selector, provider) {
-            let entry = {
-                selector,
-                provider,
-                _score: -1,
-                _time: this._clock++
-            };
-            this._entries.push(entry);
-            this._lastCandidate = undefined;
-            this._onDidChange.fire(this._entries.length);
-            return toDisposable(() => {
-                if (entry) {
-                    const idx = this._entries.indexOf(entry);
-                    if (idx >= 0) {
-                        this._entries.splice(idx, 1);
-                        this._lastCandidate = undefined;
-                        this._onDidChange.fire(this._entries.length);
-                        entry = undefined;
-                    }
-                }
-            });
-        }
-        has(model) {
-            return this.all(model).length > 0;
-        }
-        all(model) {
-            if (!model) {
-                return [];
-            }
-            this._updateScores(model);
-            const result = [];
-            // from registry
-            for (let entry of this._entries) {
-                if (entry._score > 0) {
-                    result.push(entry.provider);
-                }
-            }
-            return result;
-        }
-        ordered(model) {
-            const result = [];
-            this._orderedForEach(model, entry => result.push(entry.provider));
-            return result;
-        }
-        orderedGroups(model) {
-            const result = [];
-            let lastBucket;
-            let lastBucketScore;
-            this._orderedForEach(model, entry => {
-                if (lastBucket && lastBucketScore === entry._score) {
-                    lastBucket.push(entry.provider);
-                }
-                else {
-                    lastBucketScore = entry._score;
-                    lastBucket = [entry.provider];
-                    result.push(lastBucket);
-                }
-            });
-            return result;
-        }
-        _orderedForEach(model, callback) {
-            if (!model) {
-                return;
-            }
-            this._updateScores(model);
-            for (const entry of this._entries) {
-                if (entry._score > 0) {
-                    callback(entry);
-                }
-            }
-        }
-        _updateScores(model) {
-            const candidate = {
-                uri: model.uri.toString(),
-                language: model.getLanguageId()
-            };
-            if (this._lastCandidate
-                && this._lastCandidate.language === candidate.language
-                && this._lastCandidate.uri === candidate.uri) {
-                // nothing has changed
-                return;
-            }
-            this._lastCandidate = candidate;
-            for (let entry of this._entries) {
-                entry._score = score(entry.selector, model.uri, model.getLanguageId(), shouldSynchronizeModel(model));
-                if (isExclusive(entry.selector) && entry._score > 0) {
-                    // support for one exclusive selector that overwrites
-                    // any other selector
-                    for (let entry of this._entries) {
-                        entry._score = 0;
-                    }
-                    entry._score = 1000;
-                    break;
-                }
-            }
-            // needs sorting
-            this._entries.sort(LanguageFeatureRegistry._compareByScoreAndTime);
-        }
-        static _compareByScoreAndTime(a, b) {
-            if (a._score < b._score) {
-                return 1;
-            }
-            else if (a._score > b._score) {
-                return -1;
-            }
-            else if (a._time < b._time) {
-                return 1;
-            }
-            else if (a._time > b._time) {
-                return -1;
-            }
-            else {
-                return 0;
-            }
-        }
-    }
 
     /*---------------------------------------------------------------------------------------------
      *  Copyright (c) Microsoft Corporation. All rights reserved.
@@ -8460,28 +7650,31 @@
     };
     class TokenizationRegistry {
         constructor() {
-            this._map = new Map();
+            this._tokenizationSupports = new Map();
             this._factories = new Map();
             this._onDidChange = new Emitter();
             this.onDidChange = this._onDidChange.event;
             this._colorMap = null;
         }
-        fire(languages) {
+        handleChange(languageIds) {
             this._onDidChange.fire({
-                changedLanguages: languages,
+                changedLanguages: languageIds,
                 changedColorMap: false
             });
         }
-        register(language, support) {
-            this._map.set(language, support);
-            this.fire([language]);
+        register(languageId, support) {
+            this._tokenizationSupports.set(languageId, support);
+            this.handleChange([languageId]);
             return toDisposable(() => {
-                if (this._map.get(language) !== support) {
+                if (this._tokenizationSupports.get(languageId) !== support) {
                     return;
                 }
-                this._map.delete(language);
-                this.fire([language]);
+                this._tokenizationSupports.delete(languageId);
+                this.handleChange([languageId]);
             });
+        }
+        get(languageId) {
+            return this._tokenizationSupports.get(languageId) || null;
         }
         registerFactory(languageId, factory) {
             var _a;
@@ -8513,9 +7706,6 @@
                 return this.get(languageId);
             });
         }
-        get(language) {
-            return (this._map.get(language) || null);
-        }
         isResolved(languageId) {
             const tokenizationSupport = this.get(languageId);
             if (tokenizationSupport) {
@@ -8530,7 +7720,7 @@
         setColorMap(colorMap) {
             this._colorMap = colorMap;
             this._onDidChange.fire({
-                changedLanguages: Array.from(this._map.keys()),
+                changedLanguages: Array.from(this._tokenizationSupports.keys()),
                 changedColorMap: true
             });
         }
@@ -8538,13 +7728,16 @@
             return this._colorMap;
         }
         getDefaultBackground() {
-            if (this._colorMap && this._colorMap.length > 2 /* DefaultBackground */) {
-                return this._colorMap[2 /* DefaultBackground */];
+            if (this._colorMap && this._colorMap.length > 2 /* ColorId.DefaultBackground */) {
+                return this._colorMap[2 /* ColorId.DefaultBackground */];
             }
             return null;
         }
     }
     class TokenizationSupportFactoryData extends Disposable {
+        get isResolved() {
+            return this._isResolved;
+        }
         constructor(_registry, _languageId, _factory) {
             super();
             this._registry = _registry;
@@ -8553,9 +7746,6 @@
             this._isDisposed = false;
             this._resolvePromise = null;
             this._isResolved = false;
-        }
-        get isResolved() {
-            return this._isResolved;
         }
         dispose() {
             this._isDisposed = true;
@@ -8571,7 +7761,7 @@
         }
         _create() {
             return __awaiter$2(this, void 0, void 0, function* () {
-                const value = yield Promise.resolve(this._factory.createTokenizationSupport());
+                const value = yield this._factory.tokenizationSupport;
                 this._isResolved = true;
                 if (value && !this._isDisposed) {
                     this._register(this._registry.register(this._languageId, value));
@@ -8580,590 +7770,12 @@
         }
     }
 
-    // Selects all codicon names encapsulated in the `$()` syntax and wraps the
-    /**
-     * The Codicon library is a set of default icons that are built-in in VS Code.
-     *
-     * In the product (outside of base) Codicons should only be used as defaults. In order to have all icons in VS Code
-     * themeable, component should define new, UI component specific icons using `iconRegistry.registerIcon`.
-     * In that call a Codicon can be named as default.
-     */
-    class Codicon {
-        constructor(id, definition, description) {
-            this.id = id;
-            this.definition = definition;
-            this.description = description;
-            Codicon._allCodicons.push(this);
-        }
-        get classNames() { return 'codicon codicon-' + this.id; }
-        // classNamesArray is useful for migrating to ES6 classlist
-        get classNamesArray() { return ['codicon', 'codicon-' + this.id]; }
-        get cssSelector() { return '.codicon.codicon-' + this.id; }
-        /**
-         * @returns Returns all default icons covered by the codicon font. Only to be used by the icon registry in platform.
-         */
-        static getAll() {
-            return Codicon._allCodicons;
-        }
-    }
-    // registry
-    Codicon._allCodicons = [];
-    // built-in icons, with image name
-    Codicon.add = new Codicon('add', { fontCharacter: '\\ea60' });
-    Codicon.plus = new Codicon('plus', Codicon.add.definition);
-    Codicon.gistNew = new Codicon('gist-new', Codicon.add.definition);
-    Codicon.repoCreate = new Codicon('repo-create', Codicon.add.definition);
-    Codicon.lightbulb = new Codicon('lightbulb', { fontCharacter: '\\ea61' });
-    Codicon.lightBulb = new Codicon('light-bulb', { fontCharacter: '\\ea61' });
-    Codicon.repo = new Codicon('repo', { fontCharacter: '\\ea62' });
-    Codicon.repoDelete = new Codicon('repo-delete', { fontCharacter: '\\ea62' });
-    Codicon.gistFork = new Codicon('gist-fork', { fontCharacter: '\\ea63' });
-    Codicon.repoForked = new Codicon('repo-forked', { fontCharacter: '\\ea63' });
-    Codicon.gitPullRequest = new Codicon('git-pull-request', { fontCharacter: '\\ea64' });
-    Codicon.gitPullRequestAbandoned = new Codicon('git-pull-request-abandoned', { fontCharacter: '\\ea64' });
-    Codicon.recordKeys = new Codicon('record-keys', { fontCharacter: '\\ea65' });
-    Codicon.keyboard = new Codicon('keyboard', { fontCharacter: '\\ea65' });
-    Codicon.tag = new Codicon('tag', { fontCharacter: '\\ea66' });
-    Codicon.tagAdd = new Codicon('tag-add', { fontCharacter: '\\ea66' });
-    Codicon.tagRemove = new Codicon('tag-remove', { fontCharacter: '\\ea66' });
-    Codicon.person = new Codicon('person', { fontCharacter: '\\ea67' });
-    Codicon.personFollow = new Codicon('person-follow', { fontCharacter: '\\ea67' });
-    Codicon.personOutline = new Codicon('person-outline', { fontCharacter: '\\ea67' });
-    Codicon.personFilled = new Codicon('person-filled', { fontCharacter: '\\ea67' });
-    Codicon.gitBranch = new Codicon('git-branch', { fontCharacter: '\\ea68' });
-    Codicon.gitBranchCreate = new Codicon('git-branch-create', { fontCharacter: '\\ea68' });
-    Codicon.gitBranchDelete = new Codicon('git-branch-delete', { fontCharacter: '\\ea68' });
-    Codicon.sourceControl = new Codicon('source-control', { fontCharacter: '\\ea68' });
-    Codicon.mirror = new Codicon('mirror', { fontCharacter: '\\ea69' });
-    Codicon.mirrorPublic = new Codicon('mirror-public', { fontCharacter: '\\ea69' });
-    Codicon.star = new Codicon('star', { fontCharacter: '\\ea6a' });
-    Codicon.starAdd = new Codicon('star-add', { fontCharacter: '\\ea6a' });
-    Codicon.starDelete = new Codicon('star-delete', { fontCharacter: '\\ea6a' });
-    Codicon.starEmpty = new Codicon('star-empty', { fontCharacter: '\\ea6a' });
-    Codicon.comment = new Codicon('comment', { fontCharacter: '\\ea6b' });
-    Codicon.commentAdd = new Codicon('comment-add', { fontCharacter: '\\ea6b' });
-    Codicon.alert = new Codicon('alert', { fontCharacter: '\\ea6c' });
-    Codicon.warning = new Codicon('warning', { fontCharacter: '\\ea6c' });
-    Codicon.search = new Codicon('search', { fontCharacter: '\\ea6d' });
-    Codicon.searchSave = new Codicon('search-save', { fontCharacter: '\\ea6d' });
-    Codicon.logOut = new Codicon('log-out', { fontCharacter: '\\ea6e' });
-    Codicon.signOut = new Codicon('sign-out', { fontCharacter: '\\ea6e' });
-    Codicon.logIn = new Codicon('log-in', { fontCharacter: '\\ea6f' });
-    Codicon.signIn = new Codicon('sign-in', { fontCharacter: '\\ea6f' });
-    Codicon.eye = new Codicon('eye', { fontCharacter: '\\ea70' });
-    Codicon.eyeUnwatch = new Codicon('eye-unwatch', { fontCharacter: '\\ea70' });
-    Codicon.eyeWatch = new Codicon('eye-watch', { fontCharacter: '\\ea70' });
-    Codicon.circleFilled = new Codicon('circle-filled', { fontCharacter: '\\ea71' });
-    Codicon.primitiveDot = new Codicon('primitive-dot', { fontCharacter: '\\ea71' });
-    Codicon.closeDirty = new Codicon('close-dirty', { fontCharacter: '\\ea71' });
-    Codicon.debugBreakpoint = new Codicon('debug-breakpoint', { fontCharacter: '\\ea71' });
-    Codicon.debugBreakpointDisabled = new Codicon('debug-breakpoint-disabled', { fontCharacter: '\\ea71' });
-    Codicon.debugHint = new Codicon('debug-hint', { fontCharacter: '\\ea71' });
-    Codicon.primitiveSquare = new Codicon('primitive-square', { fontCharacter: '\\ea72' });
-    Codicon.edit = new Codicon('edit', { fontCharacter: '\\ea73' });
-    Codicon.pencil = new Codicon('pencil', { fontCharacter: '\\ea73' });
-    Codicon.info = new Codicon('info', { fontCharacter: '\\ea74' });
-    Codicon.issueOpened = new Codicon('issue-opened', { fontCharacter: '\\ea74' });
-    Codicon.gistPrivate = new Codicon('gist-private', { fontCharacter: '\\ea75' });
-    Codicon.gitForkPrivate = new Codicon('git-fork-private', { fontCharacter: '\\ea75' });
-    Codicon.lock = new Codicon('lock', { fontCharacter: '\\ea75' });
-    Codicon.mirrorPrivate = new Codicon('mirror-private', { fontCharacter: '\\ea75' });
-    Codicon.close = new Codicon('close', { fontCharacter: '\\ea76' });
-    Codicon.removeClose = new Codicon('remove-close', { fontCharacter: '\\ea76' });
-    Codicon.x = new Codicon('x', { fontCharacter: '\\ea76' });
-    Codicon.repoSync = new Codicon('repo-sync', { fontCharacter: '\\ea77' });
-    Codicon.sync = new Codicon('sync', { fontCharacter: '\\ea77' });
-    Codicon.clone = new Codicon('clone', { fontCharacter: '\\ea78' });
-    Codicon.desktopDownload = new Codicon('desktop-download', { fontCharacter: '\\ea78' });
-    Codicon.beaker = new Codicon('beaker', { fontCharacter: '\\ea79' });
-    Codicon.microscope = new Codicon('microscope', { fontCharacter: '\\ea79' });
-    Codicon.vm = new Codicon('vm', { fontCharacter: '\\ea7a' });
-    Codicon.deviceDesktop = new Codicon('device-desktop', { fontCharacter: '\\ea7a' });
-    Codicon.file = new Codicon('file', { fontCharacter: '\\ea7b' });
-    Codicon.fileText = new Codicon('file-text', { fontCharacter: '\\ea7b' });
-    Codicon.more = new Codicon('more', { fontCharacter: '\\ea7c' });
-    Codicon.ellipsis = new Codicon('ellipsis', { fontCharacter: '\\ea7c' });
-    Codicon.kebabHorizontal = new Codicon('kebab-horizontal', { fontCharacter: '\\ea7c' });
-    Codicon.mailReply = new Codicon('mail-reply', { fontCharacter: '\\ea7d' });
-    Codicon.reply = new Codicon('reply', { fontCharacter: '\\ea7d' });
-    Codicon.organization = new Codicon('organization', { fontCharacter: '\\ea7e' });
-    Codicon.organizationFilled = new Codicon('organization-filled', { fontCharacter: '\\ea7e' });
-    Codicon.organizationOutline = new Codicon('organization-outline', { fontCharacter: '\\ea7e' });
-    Codicon.newFile = new Codicon('new-file', { fontCharacter: '\\ea7f' });
-    Codicon.fileAdd = new Codicon('file-add', { fontCharacter: '\\ea7f' });
-    Codicon.newFolder = new Codicon('new-folder', { fontCharacter: '\\ea80' });
-    Codicon.fileDirectoryCreate = new Codicon('file-directory-create', { fontCharacter: '\\ea80' });
-    Codicon.trash = new Codicon('trash', { fontCharacter: '\\ea81' });
-    Codicon.trashcan = new Codicon('trashcan', { fontCharacter: '\\ea81' });
-    Codicon.history = new Codicon('history', { fontCharacter: '\\ea82' });
-    Codicon.clock = new Codicon('clock', { fontCharacter: '\\ea82' });
-    Codicon.folder = new Codicon('folder', { fontCharacter: '\\ea83' });
-    Codicon.fileDirectory = new Codicon('file-directory', { fontCharacter: '\\ea83' });
-    Codicon.symbolFolder = new Codicon('symbol-folder', { fontCharacter: '\\ea83' });
-    Codicon.logoGithub = new Codicon('logo-github', { fontCharacter: '\\ea84' });
-    Codicon.markGithub = new Codicon('mark-github', { fontCharacter: '\\ea84' });
-    Codicon.github = new Codicon('github', { fontCharacter: '\\ea84' });
-    Codicon.terminal = new Codicon('terminal', { fontCharacter: '\\ea85' });
-    Codicon.console = new Codicon('console', { fontCharacter: '\\ea85' });
-    Codicon.repl = new Codicon('repl', { fontCharacter: '\\ea85' });
-    Codicon.zap = new Codicon('zap', { fontCharacter: '\\ea86' });
-    Codicon.symbolEvent = new Codicon('symbol-event', { fontCharacter: '\\ea86' });
-    Codicon.error = new Codicon('error', { fontCharacter: '\\ea87' });
-    Codicon.stop = new Codicon('stop', { fontCharacter: '\\ea87' });
-    Codicon.variable = new Codicon('variable', { fontCharacter: '\\ea88' });
-    Codicon.symbolVariable = new Codicon('symbol-variable', { fontCharacter: '\\ea88' });
-    Codicon.array = new Codicon('array', { fontCharacter: '\\ea8a' });
-    Codicon.symbolArray = new Codicon('symbol-array', { fontCharacter: '\\ea8a' });
-    Codicon.symbolModule = new Codicon('symbol-module', { fontCharacter: '\\ea8b' });
-    Codicon.symbolPackage = new Codicon('symbol-package', { fontCharacter: '\\ea8b' });
-    Codicon.symbolNamespace = new Codicon('symbol-namespace', { fontCharacter: '\\ea8b' });
-    Codicon.symbolObject = new Codicon('symbol-object', { fontCharacter: '\\ea8b' });
-    Codicon.symbolMethod = new Codicon('symbol-method', { fontCharacter: '\\ea8c' });
-    Codicon.symbolFunction = new Codicon('symbol-function', { fontCharacter: '\\ea8c' });
-    Codicon.symbolConstructor = new Codicon('symbol-constructor', { fontCharacter: '\\ea8c' });
-    Codicon.symbolBoolean = new Codicon('symbol-boolean', { fontCharacter: '\\ea8f' });
-    Codicon.symbolNull = new Codicon('symbol-null', { fontCharacter: '\\ea8f' });
-    Codicon.symbolNumeric = new Codicon('symbol-numeric', { fontCharacter: '\\ea90' });
-    Codicon.symbolNumber = new Codicon('symbol-number', { fontCharacter: '\\ea90' });
-    Codicon.symbolStructure = new Codicon('symbol-structure', { fontCharacter: '\\ea91' });
-    Codicon.symbolStruct = new Codicon('symbol-struct', { fontCharacter: '\\ea91' });
-    Codicon.symbolParameter = new Codicon('symbol-parameter', { fontCharacter: '\\ea92' });
-    Codicon.symbolTypeParameter = new Codicon('symbol-type-parameter', { fontCharacter: '\\ea92' });
-    Codicon.symbolKey = new Codicon('symbol-key', { fontCharacter: '\\ea93' });
-    Codicon.symbolText = new Codicon('symbol-text', { fontCharacter: '\\ea93' });
-    Codicon.symbolReference = new Codicon('symbol-reference', { fontCharacter: '\\ea94' });
-    Codicon.goToFile = new Codicon('go-to-file', { fontCharacter: '\\ea94' });
-    Codicon.symbolEnum = new Codicon('symbol-enum', { fontCharacter: '\\ea95' });
-    Codicon.symbolValue = new Codicon('symbol-value', { fontCharacter: '\\ea95' });
-    Codicon.symbolRuler = new Codicon('symbol-ruler', { fontCharacter: '\\ea96' });
-    Codicon.symbolUnit = new Codicon('symbol-unit', { fontCharacter: '\\ea96' });
-    Codicon.activateBreakpoints = new Codicon('activate-breakpoints', { fontCharacter: '\\ea97' });
-    Codicon.archive = new Codicon('archive', { fontCharacter: '\\ea98' });
-    Codicon.arrowBoth = new Codicon('arrow-both', { fontCharacter: '\\ea99' });
-    Codicon.arrowDown = new Codicon('arrow-down', { fontCharacter: '\\ea9a' });
-    Codicon.arrowLeft = new Codicon('arrow-left', { fontCharacter: '\\ea9b' });
-    Codicon.arrowRight = new Codicon('arrow-right', { fontCharacter: '\\ea9c' });
-    Codicon.arrowSmallDown = new Codicon('arrow-small-down', { fontCharacter: '\\ea9d' });
-    Codicon.arrowSmallLeft = new Codicon('arrow-small-left', { fontCharacter: '\\ea9e' });
-    Codicon.arrowSmallRight = new Codicon('arrow-small-right', { fontCharacter: '\\ea9f' });
-    Codicon.arrowSmallUp = new Codicon('arrow-small-up', { fontCharacter: '\\eaa0' });
-    Codicon.arrowUp = new Codicon('arrow-up', { fontCharacter: '\\eaa1' });
-    Codicon.bell = new Codicon('bell', { fontCharacter: '\\eaa2' });
-    Codicon.bold = new Codicon('bold', { fontCharacter: '\\eaa3' });
-    Codicon.book = new Codicon('book', { fontCharacter: '\\eaa4' });
-    Codicon.bookmark = new Codicon('bookmark', { fontCharacter: '\\eaa5' });
-    Codicon.debugBreakpointConditionalUnverified = new Codicon('debug-breakpoint-conditional-unverified', { fontCharacter: '\\eaa6' });
-    Codicon.debugBreakpointConditional = new Codicon('debug-breakpoint-conditional', { fontCharacter: '\\eaa7' });
-    Codicon.debugBreakpointConditionalDisabled = new Codicon('debug-breakpoint-conditional-disabled', { fontCharacter: '\\eaa7' });
-    Codicon.debugBreakpointDataUnverified = new Codicon('debug-breakpoint-data-unverified', { fontCharacter: '\\eaa8' });
-    Codicon.debugBreakpointData = new Codicon('debug-breakpoint-data', { fontCharacter: '\\eaa9' });
-    Codicon.debugBreakpointDataDisabled = new Codicon('debug-breakpoint-data-disabled', { fontCharacter: '\\eaa9' });
-    Codicon.debugBreakpointLogUnverified = new Codicon('debug-breakpoint-log-unverified', { fontCharacter: '\\eaaa' });
-    Codicon.debugBreakpointLog = new Codicon('debug-breakpoint-log', { fontCharacter: '\\eaab' });
-    Codicon.debugBreakpointLogDisabled = new Codicon('debug-breakpoint-log-disabled', { fontCharacter: '\\eaab' });
-    Codicon.briefcase = new Codicon('briefcase', { fontCharacter: '\\eaac' });
-    Codicon.broadcast = new Codicon('broadcast', { fontCharacter: '\\eaad' });
-    Codicon.browser = new Codicon('browser', { fontCharacter: '\\eaae' });
-    Codicon.bug = new Codicon('bug', { fontCharacter: '\\eaaf' });
-    Codicon.calendar = new Codicon('calendar', { fontCharacter: '\\eab0' });
-    Codicon.caseSensitive = new Codicon('case-sensitive', { fontCharacter: '\\eab1' });
-    Codicon.check = new Codicon('check', { fontCharacter: '\\eab2' });
-    Codicon.checklist = new Codicon('checklist', { fontCharacter: '\\eab3' });
-    Codicon.chevronDown = new Codicon('chevron-down', { fontCharacter: '\\eab4' });
-    Codicon.dropDownButton = new Codicon('drop-down-button', Codicon.chevronDown.definition);
-    Codicon.chevronLeft = new Codicon('chevron-left', { fontCharacter: '\\eab5' });
-    Codicon.chevronRight = new Codicon('chevron-right', { fontCharacter: '\\eab6' });
-    Codicon.chevronUp = new Codicon('chevron-up', { fontCharacter: '\\eab7' });
-    Codicon.chromeClose = new Codicon('chrome-close', { fontCharacter: '\\eab8' });
-    Codicon.chromeMaximize = new Codicon('chrome-maximize', { fontCharacter: '\\eab9' });
-    Codicon.chromeMinimize = new Codicon('chrome-minimize', { fontCharacter: '\\eaba' });
-    Codicon.chromeRestore = new Codicon('chrome-restore', { fontCharacter: '\\eabb' });
-    Codicon.circleOutline = new Codicon('circle-outline', { fontCharacter: '\\eabc' });
-    Codicon.debugBreakpointUnverified = new Codicon('debug-breakpoint-unverified', { fontCharacter: '\\eabc' });
-    Codicon.circleSlash = new Codicon('circle-slash', { fontCharacter: '\\eabd' });
-    Codicon.circuitBoard = new Codicon('circuit-board', { fontCharacter: '\\eabe' });
-    Codicon.clearAll = new Codicon('clear-all', { fontCharacter: '\\eabf' });
-    Codicon.clippy = new Codicon('clippy', { fontCharacter: '\\eac0' });
-    Codicon.closeAll = new Codicon('close-all', { fontCharacter: '\\eac1' });
-    Codicon.cloudDownload = new Codicon('cloud-download', { fontCharacter: '\\eac2' });
-    Codicon.cloudUpload = new Codicon('cloud-upload', { fontCharacter: '\\eac3' });
-    Codicon.code = new Codicon('code', { fontCharacter: '\\eac4' });
-    Codicon.collapseAll = new Codicon('collapse-all', { fontCharacter: '\\eac5' });
-    Codicon.colorMode = new Codicon('color-mode', { fontCharacter: '\\eac6' });
-    Codicon.commentDiscussion = new Codicon('comment-discussion', { fontCharacter: '\\eac7' });
-    Codicon.compareChanges = new Codicon('compare-changes', { fontCharacter: '\\eafd' });
-    Codicon.creditCard = new Codicon('credit-card', { fontCharacter: '\\eac9' });
-    Codicon.dash = new Codicon('dash', { fontCharacter: '\\eacc' });
-    Codicon.dashboard = new Codicon('dashboard', { fontCharacter: '\\eacd' });
-    Codicon.database = new Codicon('database', { fontCharacter: '\\eace' });
-    Codicon.debugContinue = new Codicon('debug-continue', { fontCharacter: '\\eacf' });
-    Codicon.debugDisconnect = new Codicon('debug-disconnect', { fontCharacter: '\\ead0' });
-    Codicon.debugPause = new Codicon('debug-pause', { fontCharacter: '\\ead1' });
-    Codicon.debugRestart = new Codicon('debug-restart', { fontCharacter: '\\ead2' });
-    Codicon.debugStart = new Codicon('debug-start', { fontCharacter: '\\ead3' });
-    Codicon.debugStepInto = new Codicon('debug-step-into', { fontCharacter: '\\ead4' });
-    Codicon.debugStepOut = new Codicon('debug-step-out', { fontCharacter: '\\ead5' });
-    Codicon.debugStepOver = new Codicon('debug-step-over', { fontCharacter: '\\ead6' });
-    Codicon.debugStop = new Codicon('debug-stop', { fontCharacter: '\\ead7' });
-    Codicon.debug = new Codicon('debug', { fontCharacter: '\\ead8' });
-    Codicon.deviceCameraVideo = new Codicon('device-camera-video', { fontCharacter: '\\ead9' });
-    Codicon.deviceCamera = new Codicon('device-camera', { fontCharacter: '\\eada' });
-    Codicon.deviceMobile = new Codicon('device-mobile', { fontCharacter: '\\eadb' });
-    Codicon.diffAdded = new Codicon('diff-added', { fontCharacter: '\\eadc' });
-    Codicon.diffIgnored = new Codicon('diff-ignored', { fontCharacter: '\\eadd' });
-    Codicon.diffModified = new Codicon('diff-modified', { fontCharacter: '\\eade' });
-    Codicon.diffRemoved = new Codicon('diff-removed', { fontCharacter: '\\eadf' });
-    Codicon.diffRenamed = new Codicon('diff-renamed', { fontCharacter: '\\eae0' });
-    Codicon.diff = new Codicon('diff', { fontCharacter: '\\eae1' });
-    Codicon.discard = new Codicon('discard', { fontCharacter: '\\eae2' });
-    Codicon.editorLayout = new Codicon('editor-layout', { fontCharacter: '\\eae3' });
-    Codicon.emptyWindow = new Codicon('empty-window', { fontCharacter: '\\eae4' });
-    Codicon.exclude = new Codicon('exclude', { fontCharacter: '\\eae5' });
-    Codicon.extensions = new Codicon('extensions', { fontCharacter: '\\eae6' });
-    Codicon.eyeClosed = new Codicon('eye-closed', { fontCharacter: '\\eae7' });
-    Codicon.fileBinary = new Codicon('file-binary', { fontCharacter: '\\eae8' });
-    Codicon.fileCode = new Codicon('file-code', { fontCharacter: '\\eae9' });
-    Codicon.fileMedia = new Codicon('file-media', { fontCharacter: '\\eaea' });
-    Codicon.filePdf = new Codicon('file-pdf', { fontCharacter: '\\eaeb' });
-    Codicon.fileSubmodule = new Codicon('file-submodule', { fontCharacter: '\\eaec' });
-    Codicon.fileSymlinkDirectory = new Codicon('file-symlink-directory', { fontCharacter: '\\eaed' });
-    Codicon.fileSymlinkFile = new Codicon('file-symlink-file', { fontCharacter: '\\eaee' });
-    Codicon.fileZip = new Codicon('file-zip', { fontCharacter: '\\eaef' });
-    Codicon.files = new Codicon('files', { fontCharacter: '\\eaf0' });
-    Codicon.filter = new Codicon('filter', { fontCharacter: '\\eaf1' });
-    Codicon.flame = new Codicon('flame', { fontCharacter: '\\eaf2' });
-    Codicon.foldDown = new Codicon('fold-down', { fontCharacter: '\\eaf3' });
-    Codicon.foldUp = new Codicon('fold-up', { fontCharacter: '\\eaf4' });
-    Codicon.fold = new Codicon('fold', { fontCharacter: '\\eaf5' });
-    Codicon.folderActive = new Codicon('folder-active', { fontCharacter: '\\eaf6' });
-    Codicon.folderOpened = new Codicon('folder-opened', { fontCharacter: '\\eaf7' });
-    Codicon.gear = new Codicon('gear', { fontCharacter: '\\eaf8' });
-    Codicon.gift = new Codicon('gift', { fontCharacter: '\\eaf9' });
-    Codicon.gistSecret = new Codicon('gist-secret', { fontCharacter: '\\eafa' });
-    Codicon.gist = new Codicon('gist', { fontCharacter: '\\eafb' });
-    Codicon.gitCommit = new Codicon('git-commit', { fontCharacter: '\\eafc' });
-    Codicon.gitCompare = new Codicon('git-compare', { fontCharacter: '\\eafd' });
-    Codicon.gitMerge = new Codicon('git-merge', { fontCharacter: '\\eafe' });
-    Codicon.githubAction = new Codicon('github-action', { fontCharacter: '\\eaff' });
-    Codicon.githubAlt = new Codicon('github-alt', { fontCharacter: '\\eb00' });
-    Codicon.globe = new Codicon('globe', { fontCharacter: '\\eb01' });
-    Codicon.grabber = new Codicon('grabber', { fontCharacter: '\\eb02' });
-    Codicon.graph = new Codicon('graph', { fontCharacter: '\\eb03' });
-    Codicon.gripper = new Codicon('gripper', { fontCharacter: '\\eb04' });
-    Codicon.heart = new Codicon('heart', { fontCharacter: '\\eb05' });
-    Codicon.home = new Codicon('home', { fontCharacter: '\\eb06' });
-    Codicon.horizontalRule = new Codicon('horizontal-rule', { fontCharacter: '\\eb07' });
-    Codicon.hubot = new Codicon('hubot', { fontCharacter: '\\eb08' });
-    Codicon.inbox = new Codicon('inbox', { fontCharacter: '\\eb09' });
-    Codicon.issueClosed = new Codicon('issue-closed', { fontCharacter: '\\eba4' });
-    Codicon.issueReopened = new Codicon('issue-reopened', { fontCharacter: '\\eb0b' });
-    Codicon.issues = new Codicon('issues', { fontCharacter: '\\eb0c' });
-    Codicon.italic = new Codicon('italic', { fontCharacter: '\\eb0d' });
-    Codicon.jersey = new Codicon('jersey', { fontCharacter: '\\eb0e' });
-    Codicon.json = new Codicon('json', { fontCharacter: '\\eb0f' });
-    Codicon.kebabVertical = new Codicon('kebab-vertical', { fontCharacter: '\\eb10' });
-    Codicon.key = new Codicon('key', { fontCharacter: '\\eb11' });
-    Codicon.law = new Codicon('law', { fontCharacter: '\\eb12' });
-    Codicon.lightbulbAutofix = new Codicon('lightbulb-autofix', { fontCharacter: '\\eb13' });
-    Codicon.linkExternal = new Codicon('link-external', { fontCharacter: '\\eb14' });
-    Codicon.link = new Codicon('link', { fontCharacter: '\\eb15' });
-    Codicon.listOrdered = new Codicon('list-ordered', { fontCharacter: '\\eb16' });
-    Codicon.listUnordered = new Codicon('list-unordered', { fontCharacter: '\\eb17' });
-    Codicon.liveShare = new Codicon('live-share', { fontCharacter: '\\eb18' });
-    Codicon.loading = new Codicon('loading', { fontCharacter: '\\eb19' });
-    Codicon.location = new Codicon('location', { fontCharacter: '\\eb1a' });
-    Codicon.mailRead = new Codicon('mail-read', { fontCharacter: '\\eb1b' });
-    Codicon.mail = new Codicon('mail', { fontCharacter: '\\eb1c' });
-    Codicon.markdown = new Codicon('markdown', { fontCharacter: '\\eb1d' });
-    Codicon.megaphone = new Codicon('megaphone', { fontCharacter: '\\eb1e' });
-    Codicon.mention = new Codicon('mention', { fontCharacter: '\\eb1f' });
-    Codicon.milestone = new Codicon('milestone', { fontCharacter: '\\eb20' });
-    Codicon.mortarBoard = new Codicon('mortar-board', { fontCharacter: '\\eb21' });
-    Codicon.move = new Codicon('move', { fontCharacter: '\\eb22' });
-    Codicon.multipleWindows = new Codicon('multiple-windows', { fontCharacter: '\\eb23' });
-    Codicon.mute = new Codicon('mute', { fontCharacter: '\\eb24' });
-    Codicon.noNewline = new Codicon('no-newline', { fontCharacter: '\\eb25' });
-    Codicon.note = new Codicon('note', { fontCharacter: '\\eb26' });
-    Codicon.octoface = new Codicon('octoface', { fontCharacter: '\\eb27' });
-    Codicon.openPreview = new Codicon('open-preview', { fontCharacter: '\\eb28' });
-    Codicon.package_ = new Codicon('package', { fontCharacter: '\\eb29' });
-    Codicon.paintcan = new Codicon('paintcan', { fontCharacter: '\\eb2a' });
-    Codicon.pin = new Codicon('pin', { fontCharacter: '\\eb2b' });
-    Codicon.play = new Codicon('play', { fontCharacter: '\\eb2c' });
-    Codicon.run = new Codicon('run', { fontCharacter: '\\eb2c' });
-    Codicon.plug = new Codicon('plug', { fontCharacter: '\\eb2d' });
-    Codicon.preserveCase = new Codicon('preserve-case', { fontCharacter: '\\eb2e' });
-    Codicon.preview = new Codicon('preview', { fontCharacter: '\\eb2f' });
-    Codicon.project = new Codicon('project', { fontCharacter: '\\eb30' });
-    Codicon.pulse = new Codicon('pulse', { fontCharacter: '\\eb31' });
-    Codicon.question = new Codicon('question', { fontCharacter: '\\eb32' });
-    Codicon.quote = new Codicon('quote', { fontCharacter: '\\eb33' });
-    Codicon.radioTower = new Codicon('radio-tower', { fontCharacter: '\\eb34' });
-    Codicon.reactions = new Codicon('reactions', { fontCharacter: '\\eb35' });
-    Codicon.references = new Codicon('references', { fontCharacter: '\\eb36' });
-    Codicon.refresh = new Codicon('refresh', { fontCharacter: '\\eb37' });
-    Codicon.regex = new Codicon('regex', { fontCharacter: '\\eb38' });
-    Codicon.remoteExplorer = new Codicon('remote-explorer', { fontCharacter: '\\eb39' });
-    Codicon.remote = new Codicon('remote', { fontCharacter: '\\eb3a' });
-    Codicon.remove = new Codicon('remove', { fontCharacter: '\\eb3b' });
-    Codicon.replaceAll = new Codicon('replace-all', { fontCharacter: '\\eb3c' });
-    Codicon.replace = new Codicon('replace', { fontCharacter: '\\eb3d' });
-    Codicon.repoClone = new Codicon('repo-clone', { fontCharacter: '\\eb3e' });
-    Codicon.repoForcePush = new Codicon('repo-force-push', { fontCharacter: '\\eb3f' });
-    Codicon.repoPull = new Codicon('repo-pull', { fontCharacter: '\\eb40' });
-    Codicon.repoPush = new Codicon('repo-push', { fontCharacter: '\\eb41' });
-    Codicon.report = new Codicon('report', { fontCharacter: '\\eb42' });
-    Codicon.requestChanges = new Codicon('request-changes', { fontCharacter: '\\eb43' });
-    Codicon.rocket = new Codicon('rocket', { fontCharacter: '\\eb44' });
-    Codicon.rootFolderOpened = new Codicon('root-folder-opened', { fontCharacter: '\\eb45' });
-    Codicon.rootFolder = new Codicon('root-folder', { fontCharacter: '\\eb46' });
-    Codicon.rss = new Codicon('rss', { fontCharacter: '\\eb47' });
-    Codicon.ruby = new Codicon('ruby', { fontCharacter: '\\eb48' });
-    Codicon.saveAll = new Codicon('save-all', { fontCharacter: '\\eb49' });
-    Codicon.saveAs = new Codicon('save-as', { fontCharacter: '\\eb4a' });
-    Codicon.save = new Codicon('save', { fontCharacter: '\\eb4b' });
-    Codicon.screenFull = new Codicon('screen-full', { fontCharacter: '\\eb4c' });
-    Codicon.screenNormal = new Codicon('screen-normal', { fontCharacter: '\\eb4d' });
-    Codicon.searchStop = new Codicon('search-stop', { fontCharacter: '\\eb4e' });
-    Codicon.server = new Codicon('server', { fontCharacter: '\\eb50' });
-    Codicon.settingsGear = new Codicon('settings-gear', { fontCharacter: '\\eb51' });
-    Codicon.settings = new Codicon('settings', { fontCharacter: '\\eb52' });
-    Codicon.shield = new Codicon('shield', { fontCharacter: '\\eb53' });
-    Codicon.smiley = new Codicon('smiley', { fontCharacter: '\\eb54' });
-    Codicon.sortPrecedence = new Codicon('sort-precedence', { fontCharacter: '\\eb55' });
-    Codicon.splitHorizontal = new Codicon('split-horizontal', { fontCharacter: '\\eb56' });
-    Codicon.splitVertical = new Codicon('split-vertical', { fontCharacter: '\\eb57' });
-    Codicon.squirrel = new Codicon('squirrel', { fontCharacter: '\\eb58' });
-    Codicon.starFull = new Codicon('star-full', { fontCharacter: '\\eb59' });
-    Codicon.starHalf = new Codicon('star-half', { fontCharacter: '\\eb5a' });
-    Codicon.symbolClass = new Codicon('symbol-class', { fontCharacter: '\\eb5b' });
-    Codicon.symbolColor = new Codicon('symbol-color', { fontCharacter: '\\eb5c' });
-    Codicon.symbolCustomColor = new Codicon('symbol-customcolor', { fontCharacter: '\\eb5c' });
-    Codicon.symbolConstant = new Codicon('symbol-constant', { fontCharacter: '\\eb5d' });
-    Codicon.symbolEnumMember = new Codicon('symbol-enum-member', { fontCharacter: '\\eb5e' });
-    Codicon.symbolField = new Codicon('symbol-field', { fontCharacter: '\\eb5f' });
-    Codicon.symbolFile = new Codicon('symbol-file', { fontCharacter: '\\eb60' });
-    Codicon.symbolInterface = new Codicon('symbol-interface', { fontCharacter: '\\eb61' });
-    Codicon.symbolKeyword = new Codicon('symbol-keyword', { fontCharacter: '\\eb62' });
-    Codicon.symbolMisc = new Codicon('symbol-misc', { fontCharacter: '\\eb63' });
-    Codicon.symbolOperator = new Codicon('symbol-operator', { fontCharacter: '\\eb64' });
-    Codicon.symbolProperty = new Codicon('symbol-property', { fontCharacter: '\\eb65' });
-    Codicon.wrench = new Codicon('wrench', { fontCharacter: '\\eb65' });
-    Codicon.wrenchSubaction = new Codicon('wrench-subaction', { fontCharacter: '\\eb65' });
-    Codicon.symbolSnippet = new Codicon('symbol-snippet', { fontCharacter: '\\eb66' });
-    Codicon.tasklist = new Codicon('tasklist', { fontCharacter: '\\eb67' });
-    Codicon.telescope = new Codicon('telescope', { fontCharacter: '\\eb68' });
-    Codicon.textSize = new Codicon('text-size', { fontCharacter: '\\eb69' });
-    Codicon.threeBars = new Codicon('three-bars', { fontCharacter: '\\eb6a' });
-    Codicon.thumbsdown = new Codicon('thumbsdown', { fontCharacter: '\\eb6b' });
-    Codicon.thumbsup = new Codicon('thumbsup', { fontCharacter: '\\eb6c' });
-    Codicon.tools = new Codicon('tools', { fontCharacter: '\\eb6d' });
-    Codicon.triangleDown = new Codicon('triangle-down', { fontCharacter: '\\eb6e' });
-    Codicon.triangleLeft = new Codicon('triangle-left', { fontCharacter: '\\eb6f' });
-    Codicon.triangleRight = new Codicon('triangle-right', { fontCharacter: '\\eb70' });
-    Codicon.triangleUp = new Codicon('triangle-up', { fontCharacter: '\\eb71' });
-    Codicon.twitter = new Codicon('twitter', { fontCharacter: '\\eb72' });
-    Codicon.unfold = new Codicon('unfold', { fontCharacter: '\\eb73' });
-    Codicon.unlock = new Codicon('unlock', { fontCharacter: '\\eb74' });
-    Codicon.unmute = new Codicon('unmute', { fontCharacter: '\\eb75' });
-    Codicon.unverified = new Codicon('unverified', { fontCharacter: '\\eb76' });
-    Codicon.verified = new Codicon('verified', { fontCharacter: '\\eb77' });
-    Codicon.versions = new Codicon('versions', { fontCharacter: '\\eb78' });
-    Codicon.vmActive = new Codicon('vm-active', { fontCharacter: '\\eb79' });
-    Codicon.vmOutline = new Codicon('vm-outline', { fontCharacter: '\\eb7a' });
-    Codicon.vmRunning = new Codicon('vm-running', { fontCharacter: '\\eb7b' });
-    Codicon.watch = new Codicon('watch', { fontCharacter: '\\eb7c' });
-    Codicon.whitespace = new Codicon('whitespace', { fontCharacter: '\\eb7d' });
-    Codicon.wholeWord = new Codicon('whole-word', { fontCharacter: '\\eb7e' });
-    Codicon.window = new Codicon('window', { fontCharacter: '\\eb7f' });
-    Codicon.wordWrap = new Codicon('word-wrap', { fontCharacter: '\\eb80' });
-    Codicon.zoomIn = new Codicon('zoom-in', { fontCharacter: '\\eb81' });
-    Codicon.zoomOut = new Codicon('zoom-out', { fontCharacter: '\\eb82' });
-    Codicon.listFilter = new Codicon('list-filter', { fontCharacter: '\\eb83' });
-    Codicon.listFlat = new Codicon('list-flat', { fontCharacter: '\\eb84' });
-    Codicon.listSelection = new Codicon('list-selection', { fontCharacter: '\\eb85' });
-    Codicon.selection = new Codicon('selection', { fontCharacter: '\\eb85' });
-    Codicon.listTree = new Codicon('list-tree', { fontCharacter: '\\eb86' });
-    Codicon.debugBreakpointFunctionUnverified = new Codicon('debug-breakpoint-function-unverified', { fontCharacter: '\\eb87' });
-    Codicon.debugBreakpointFunction = new Codicon('debug-breakpoint-function', { fontCharacter: '\\eb88' });
-    Codicon.debugBreakpointFunctionDisabled = new Codicon('debug-breakpoint-function-disabled', { fontCharacter: '\\eb88' });
-    Codicon.debugStackframeActive = new Codicon('debug-stackframe-active', { fontCharacter: '\\eb89' });
-    Codicon.debugStackframeDot = new Codicon('debug-stackframe-dot', { fontCharacter: '\\eb8a' });
-    Codicon.debugStackframe = new Codicon('debug-stackframe', { fontCharacter: '\\eb8b' });
-    Codicon.debugStackframeFocused = new Codicon('debug-stackframe-focused', { fontCharacter: '\\eb8b' });
-    Codicon.debugBreakpointUnsupported = new Codicon('debug-breakpoint-unsupported', { fontCharacter: '\\eb8c' });
-    Codicon.symbolString = new Codicon('symbol-string', { fontCharacter: '\\eb8d' });
-    Codicon.debugReverseContinue = new Codicon('debug-reverse-continue', { fontCharacter: '\\eb8e' });
-    Codicon.debugStepBack = new Codicon('debug-step-back', { fontCharacter: '\\eb8f' });
-    Codicon.debugRestartFrame = new Codicon('debug-restart-frame', { fontCharacter: '\\eb90' });
-    Codicon.callIncoming = new Codicon('call-incoming', { fontCharacter: '\\eb92' });
-    Codicon.callOutgoing = new Codicon('call-outgoing', { fontCharacter: '\\eb93' });
-    Codicon.menu = new Codicon('menu', { fontCharacter: '\\eb94' });
-    Codicon.expandAll = new Codicon('expand-all', { fontCharacter: '\\eb95' });
-    Codicon.feedback = new Codicon('feedback', { fontCharacter: '\\eb96' });
-    Codicon.groupByRefType = new Codicon('group-by-ref-type', { fontCharacter: '\\eb97' });
-    Codicon.ungroupByRefType = new Codicon('ungroup-by-ref-type', { fontCharacter: '\\eb98' });
-    Codicon.account = new Codicon('account', { fontCharacter: '\\eb99' });
-    Codicon.bellDot = new Codicon('bell-dot', { fontCharacter: '\\eb9a' });
-    Codicon.debugConsole = new Codicon('debug-console', { fontCharacter: '\\eb9b' });
-    Codicon.library = new Codicon('library', { fontCharacter: '\\eb9c' });
-    Codicon.output = new Codicon('output', { fontCharacter: '\\eb9d' });
-    Codicon.runAll = new Codicon('run-all', { fontCharacter: '\\eb9e' });
-    Codicon.syncIgnored = new Codicon('sync-ignored', { fontCharacter: '\\eb9f' });
-    Codicon.pinned = new Codicon('pinned', { fontCharacter: '\\eba0' });
-    Codicon.githubInverted = new Codicon('github-inverted', { fontCharacter: '\\eba1' });
-    Codicon.debugAlt = new Codicon('debug-alt', { fontCharacter: '\\eb91' });
-    Codicon.serverProcess = new Codicon('server-process', { fontCharacter: '\\eba2' });
-    Codicon.serverEnvironment = new Codicon('server-environment', { fontCharacter: '\\eba3' });
-    Codicon.pass = new Codicon('pass', { fontCharacter: '\\eba4' });
-    Codicon.stopCircle = new Codicon('stop-circle', { fontCharacter: '\\eba5' });
-    Codicon.playCircle = new Codicon('play-circle', { fontCharacter: '\\eba6' });
-    Codicon.record = new Codicon('record', { fontCharacter: '\\eba7' });
-    Codicon.debugAltSmall = new Codicon('debug-alt-small', { fontCharacter: '\\eba8' });
-    Codicon.vmConnect = new Codicon('vm-connect', { fontCharacter: '\\eba9' });
-    Codicon.cloud = new Codicon('cloud', { fontCharacter: '\\ebaa' });
-    Codicon.merge = new Codicon('merge', { fontCharacter: '\\ebab' });
-    Codicon.exportIcon = new Codicon('export', { fontCharacter: '\\ebac' });
-    Codicon.graphLeft = new Codicon('graph-left', { fontCharacter: '\\ebad' });
-    Codicon.magnet = new Codicon('magnet', { fontCharacter: '\\ebae' });
-    Codicon.notebook = new Codicon('notebook', { fontCharacter: '\\ebaf' });
-    Codicon.redo = new Codicon('redo', { fontCharacter: '\\ebb0' });
-    Codicon.checkAll = new Codicon('check-all', { fontCharacter: '\\ebb1' });
-    Codicon.pinnedDirty = new Codicon('pinned-dirty', { fontCharacter: '\\ebb2' });
-    Codicon.passFilled = new Codicon('pass-filled', { fontCharacter: '\\ebb3' });
-    Codicon.circleLargeFilled = new Codicon('circle-large-filled', { fontCharacter: '\\ebb4' });
-    Codicon.circleLargeOutline = new Codicon('circle-large-outline', { fontCharacter: '\\ebb5' });
-    Codicon.combine = new Codicon('combine', { fontCharacter: '\\ebb6' });
-    Codicon.gather = new Codicon('gather', { fontCharacter: '\\ebb6' });
-    Codicon.table = new Codicon('table', { fontCharacter: '\\ebb7' });
-    Codicon.variableGroup = new Codicon('variable-group', { fontCharacter: '\\ebb8' });
-    Codicon.typeHierarchy = new Codicon('type-hierarchy', { fontCharacter: '\\ebb9' });
-    Codicon.typeHierarchySub = new Codicon('type-hierarchy-sub', { fontCharacter: '\\ebba' });
-    Codicon.typeHierarchySuper = new Codicon('type-hierarchy-super', { fontCharacter: '\\ebbb' });
-    Codicon.gitPullRequestCreate = new Codicon('git-pull-request-create', { fontCharacter: '\\ebbc' });
-    Codicon.runAbove = new Codicon('run-above', { fontCharacter: '\\ebbd' });
-    Codicon.runBelow = new Codicon('run-below', { fontCharacter: '\\ebbe' });
-    Codicon.notebookTemplate = new Codicon('notebook-template', { fontCharacter: '\\ebbf' });
-    Codicon.debugRerun = new Codicon('debug-rerun', { fontCharacter: '\\ebc0' });
-    Codicon.workspaceTrusted = new Codicon('workspace-trusted', { fontCharacter: '\\ebc1' });
-    Codicon.workspaceUntrusted = new Codicon('workspace-untrusted', { fontCharacter: '\\ebc2' });
-    Codicon.workspaceUnspecified = new Codicon('workspace-unspecified', { fontCharacter: '\\ebc3' });
-    Codicon.terminalCmd = new Codicon('terminal-cmd', { fontCharacter: '\\ebc4' });
-    Codicon.terminalDebian = new Codicon('terminal-debian', { fontCharacter: '\\ebc5' });
-    Codicon.terminalLinux = new Codicon('terminal-linux', { fontCharacter: '\\ebc6' });
-    Codicon.terminalPowershell = new Codicon('terminal-powershell', { fontCharacter: '\\ebc7' });
-    Codicon.terminalTmux = new Codicon('terminal-tmux', { fontCharacter: '\\ebc8' });
-    Codicon.terminalUbuntu = new Codicon('terminal-ubuntu', { fontCharacter: '\\ebc9' });
-    Codicon.terminalBash = new Codicon('terminal-bash', { fontCharacter: '\\ebca' });
-    Codicon.arrowSwap = new Codicon('arrow-swap', { fontCharacter: '\\ebcb' });
-    Codicon.copy = new Codicon('copy', { fontCharacter: '\\ebcc' });
-    Codicon.personAdd = new Codicon('person-add', { fontCharacter: '\\ebcd' });
-    Codicon.filterFilled = new Codicon('filter-filled', { fontCharacter: '\\ebce' });
-    Codicon.wand = new Codicon('wand', { fontCharacter: '\\ebcf' });
-    Codicon.debugLineByLine = new Codicon('debug-line-by-line', { fontCharacter: '\\ebd0' });
-    Codicon.inspect = new Codicon('inspect', { fontCharacter: '\\ebd1' });
-    Codicon.layers = new Codicon('layers', { fontCharacter: '\\ebd2' });
-    Codicon.layersDot = new Codicon('layers-dot', { fontCharacter: '\\ebd3' });
-    Codicon.layersActive = new Codicon('layers-active', { fontCharacter: '\\ebd4' });
-    Codicon.compass = new Codicon('compass', { fontCharacter: '\\ebd5' });
-    Codicon.compassDot = new Codicon('compass-dot', { fontCharacter: '\\ebd6' });
-    Codicon.compassActive = new Codicon('compass-active', { fontCharacter: '\\ebd7' });
-    Codicon.azure = new Codicon('azure', { fontCharacter: '\\ebd8' });
-    Codicon.issueDraft = new Codicon('issue-draft', { fontCharacter: '\\ebd9' });
-    Codicon.gitPullRequestClosed = new Codicon('git-pull-request-closed', { fontCharacter: '\\ebda' });
-    Codicon.gitPullRequestDraft = new Codicon('git-pull-request-draft', { fontCharacter: '\\ebdb' });
-    Codicon.debugAll = new Codicon('debug-all', { fontCharacter: '\\ebdc' });
-    Codicon.debugCoverage = new Codicon('debug-coverage', { fontCharacter: '\\ebdd' });
-    Codicon.runErrors = new Codicon('run-errors', { fontCharacter: '\\ebde' });
-    Codicon.folderLibrary = new Codicon('folder-library', { fontCharacter: '\\ebdf' });
-    Codicon.debugContinueSmall = new Codicon('debug-continue-small', { fontCharacter: '\\ebe0' });
-    Codicon.beakerStop = new Codicon('beaker-stop', { fontCharacter: '\\ebe1' });
-    Codicon.graphLine = new Codicon('graph-line', { fontCharacter: '\\ebe2' });
-    Codicon.graphScatter = new Codicon('graph-scatter', { fontCharacter: '\\ebe3' });
-    Codicon.pieChart = new Codicon('pie-chart', { fontCharacter: '\\ebe4' });
-    Codicon.bracket = new Codicon('bracket', Codicon.json.definition);
-    Codicon.bracketDot = new Codicon('bracket-dot', { fontCharacter: '\\ebe5' });
-    Codicon.bracketError = new Codicon('bracket-error', { fontCharacter: '\\ebe6' });
-    Codicon.lockSmall = new Codicon('lock-small', { fontCharacter: '\\ebe7' });
-    Codicon.azureDevops = new Codicon('azure-devops', { fontCharacter: '\\ebe8' });
-    Codicon.verifiedFilled = new Codicon('verified-filled', { fontCharacter: '\\ebe9' });
-    Codicon.newLine = new Codicon('newline', { fontCharacter: '\\ebea' });
-    Codicon.layout = new Codicon('layout', { fontCharacter: '\\ebeb' });
-    Codicon.layoutActivitybarLeft = new Codicon('layout-activitybar-left', { fontCharacter: '\\ebec' });
-    Codicon.layoutActivitybarRight = new Codicon('layout-activitybar-right', { fontCharacter: '\\ebed' });
-    Codicon.layoutPanelLeft = new Codicon('layout-panel-left', { fontCharacter: '\\ebee' });
-    Codicon.layoutPanelCenter = new Codicon('layout-panel-center', { fontCharacter: '\\ebef' });
-    Codicon.layoutPanelJustify = new Codicon('layout-panel-justify', { fontCharacter: '\\ebf0' });
-    Codicon.layoutPanelRight = new Codicon('layout-panel-right', { fontCharacter: '\\ebf1' });
-    Codicon.layoutPanel = new Codicon('layout-panel', { fontCharacter: '\\ebf2' });
-    Codicon.layoutSidebarLeft = new Codicon('layout-sidebar-left', { fontCharacter: '\\ebf3' });
-    Codicon.layoutSidebarRight = new Codicon('layout-sidebar-right', { fontCharacter: '\\ebf4' });
-    Codicon.layoutStatusbar = new Codicon('layout-statusbar', { fontCharacter: '\\ebf5' });
-    Codicon.layoutMenubar = new Codicon('layout-menubar', { fontCharacter: '\\ebf6' });
-    Codicon.layoutCentered = new Codicon('layout-centered', { fontCharacter: '\\ebf7' });
-    Codicon.target = new Codicon('target', { fontCharacter: '\\ebf8' });
-    // derived icons, that could become separate icons
-    Codicon.dialogError = new Codicon('dialog-error', Codicon.error.definition);
-    Codicon.dialogWarning = new Codicon('dialog-warning', Codicon.warning.definition);
-    Codicon.dialogInfo = new Codicon('dialog-info', Codicon.info.definition);
-    Codicon.dialogClose = new Codicon('dialog-close', Codicon.close.definition);
-    Codicon.treeItemExpanded = new Codicon('tree-item-expanded', Codicon.chevronDown.definition); // collapsed is done with rotation
-    Codicon.treeFilterOnTypeOn = new Codicon('tree-filter-on-type-on', Codicon.listFilter.definition);
-    Codicon.treeFilterOnTypeOff = new Codicon('tree-filter-on-type-off', Codicon.listSelection.definition);
-    Codicon.treeFilterClear = new Codicon('tree-filter-clear', Codicon.close.definition);
-    Codicon.treeItemLoading = new Codicon('tree-item-loading', Codicon.loading.definition);
-    Codicon.menuSelection = new Codicon('menu-selection', Codicon.check.definition);
-    Codicon.menuSubmenu = new Codicon('menu-submenu', Codicon.chevronRight.definition);
-    Codicon.menuBarMore = new Codicon('menubar-more', Codicon.more.definition);
-    Codicon.scrollbarButtonLeft = new Codicon('scrollbar-button-left', Codicon.triangleLeft.definition);
-    Codicon.scrollbarButtonRight = new Codicon('scrollbar-button-right', Codicon.triangleRight.definition);
-    Codicon.scrollbarButtonUp = new Codicon('scrollbar-button-up', Codicon.triangleUp.definition);
-    Codicon.scrollbarButtonDown = new Codicon('scrollbar-button-down', Codicon.triangleDown.definition);
-    Codicon.toolBarMore = new Codicon('toolbar-more', Codicon.more.definition);
-    Codicon.quickInputBack = new Codicon('quick-input-back', Codicon.arrowLeft.definition);
-    var CSSIcon;
-    (function (CSSIcon) {
-        CSSIcon.iconNameSegment = '[A-Za-z0-9]+';
-        CSSIcon.iconNameExpression = '[A-Za-z0-9-]+';
-        CSSIcon.iconModifierExpression = '~[A-Za-z]+';
-        CSSIcon.iconNameCharacter = '[A-Za-z0-9~-]';
-        const cssIconIdRegex = new RegExp(`^(${CSSIcon.iconNameExpression})(${CSSIcon.iconModifierExpression})?$`);
-        function asClassNameArray(icon) {
-            if (icon instanceof Codicon) {
-                return ['codicon', 'codicon-' + icon.id];
-            }
-            const match = cssIconIdRegex.exec(icon.id);
-            if (!match) {
-                return asClassNameArray(Codicon.error);
-            }
-            let [, id, modifier] = match;
-            const classNames = ['codicon', 'codicon-' + id];
-            if (modifier) {
-                classNames.push('codicon-modifier-' + modifier.substr(1));
-            }
-            return classNames;
-        }
-        CSSIcon.asClassNameArray = asClassNameArray;
-        function asClassName(icon) {
-            return asClassNameArray(icon).join(' ');
-        }
-        CSSIcon.asClassName = asClassName;
-        function asCSSSelector(icon) {
-            return '.' + asClassNameArray(icon).join('.');
-        }
-        CSSIcon.asCSSSelector = asCSSSelector;
-    })(CSSIcon || (CSSIcon = {}));
-
-    /*---------------------------------------------------------------------------------------------
-     *  Copyright (c) Microsoft Corporation. All rights reserved.
-     *  Licensed under the MIT License. See License.txt in the project root for license information.
-     *--------------------------------------------------------------------------------------------*/
     class Token {
         constructor(offset, type, language) {
-            this._tokenBrand = undefined;
             this.offset = offset;
             this.type = type;
             this.language = language;
+            this._tokenBrand = undefined;
         }
         toString() {
             return '(' + this.offset + ', ' + this.type + ')';
@@ -9175,35 +7787,35 @@
     var CompletionItemKinds;
     (function (CompletionItemKinds) {
         const byKind = new Map();
-        byKind.set(0 /* Method */, Codicon.symbolMethod);
-        byKind.set(1 /* Function */, Codicon.symbolFunction);
-        byKind.set(2 /* Constructor */, Codicon.symbolConstructor);
-        byKind.set(3 /* Field */, Codicon.symbolField);
-        byKind.set(4 /* Variable */, Codicon.symbolVariable);
-        byKind.set(5 /* Class */, Codicon.symbolClass);
-        byKind.set(6 /* Struct */, Codicon.symbolStruct);
-        byKind.set(7 /* Interface */, Codicon.symbolInterface);
-        byKind.set(8 /* Module */, Codicon.symbolModule);
-        byKind.set(9 /* Property */, Codicon.symbolProperty);
-        byKind.set(10 /* Event */, Codicon.symbolEvent);
-        byKind.set(11 /* Operator */, Codicon.symbolOperator);
-        byKind.set(12 /* Unit */, Codicon.symbolUnit);
-        byKind.set(13 /* Value */, Codicon.symbolValue);
-        byKind.set(15 /* Enum */, Codicon.symbolEnum);
-        byKind.set(14 /* Constant */, Codicon.symbolConstant);
-        byKind.set(15 /* Enum */, Codicon.symbolEnum);
-        byKind.set(16 /* EnumMember */, Codicon.symbolEnumMember);
-        byKind.set(17 /* Keyword */, Codicon.symbolKeyword);
-        byKind.set(27 /* Snippet */, Codicon.symbolSnippet);
-        byKind.set(18 /* Text */, Codicon.symbolText);
-        byKind.set(19 /* Color */, Codicon.symbolColor);
-        byKind.set(20 /* File */, Codicon.symbolFile);
-        byKind.set(21 /* Reference */, Codicon.symbolReference);
-        byKind.set(22 /* Customcolor */, Codicon.symbolCustomColor);
-        byKind.set(23 /* Folder */, Codicon.symbolFolder);
-        byKind.set(24 /* TypeParameter */, Codicon.symbolTypeParameter);
-        byKind.set(25 /* User */, Codicon.account);
-        byKind.set(26 /* Issue */, Codicon.issues);
+        byKind.set(0 /* CompletionItemKind.Method */, Codicon.symbolMethod);
+        byKind.set(1 /* CompletionItemKind.Function */, Codicon.symbolFunction);
+        byKind.set(2 /* CompletionItemKind.Constructor */, Codicon.symbolConstructor);
+        byKind.set(3 /* CompletionItemKind.Field */, Codicon.symbolField);
+        byKind.set(4 /* CompletionItemKind.Variable */, Codicon.symbolVariable);
+        byKind.set(5 /* CompletionItemKind.Class */, Codicon.symbolClass);
+        byKind.set(6 /* CompletionItemKind.Struct */, Codicon.symbolStruct);
+        byKind.set(7 /* CompletionItemKind.Interface */, Codicon.symbolInterface);
+        byKind.set(8 /* CompletionItemKind.Module */, Codicon.symbolModule);
+        byKind.set(9 /* CompletionItemKind.Property */, Codicon.symbolProperty);
+        byKind.set(10 /* CompletionItemKind.Event */, Codicon.symbolEvent);
+        byKind.set(11 /* CompletionItemKind.Operator */, Codicon.symbolOperator);
+        byKind.set(12 /* CompletionItemKind.Unit */, Codicon.symbolUnit);
+        byKind.set(13 /* CompletionItemKind.Value */, Codicon.symbolValue);
+        byKind.set(15 /* CompletionItemKind.Enum */, Codicon.symbolEnum);
+        byKind.set(14 /* CompletionItemKind.Constant */, Codicon.symbolConstant);
+        byKind.set(15 /* CompletionItemKind.Enum */, Codicon.symbolEnum);
+        byKind.set(16 /* CompletionItemKind.EnumMember */, Codicon.symbolEnumMember);
+        byKind.set(17 /* CompletionItemKind.Keyword */, Codicon.symbolKeyword);
+        byKind.set(27 /* CompletionItemKind.Snippet */, Codicon.symbolSnippet);
+        byKind.set(18 /* CompletionItemKind.Text */, Codicon.symbolText);
+        byKind.set(19 /* CompletionItemKind.Color */, Codicon.symbolColor);
+        byKind.set(20 /* CompletionItemKind.File */, Codicon.symbolFile);
+        byKind.set(21 /* CompletionItemKind.Reference */, Codicon.symbolReference);
+        byKind.set(22 /* CompletionItemKind.Customcolor */, Codicon.symbolCustomColor);
+        byKind.set(23 /* CompletionItemKind.Folder */, Codicon.symbolFolder);
+        byKind.set(24 /* CompletionItemKind.TypeParameter */, Codicon.symbolTypeParameter);
+        byKind.set(25 /* CompletionItemKind.User */, Codicon.account);
+        byKind.set(26 /* CompletionItemKind.Issue */, Codicon.issues);
         /**
          * @internal
          */
@@ -9217,43 +7829,43 @@
         }
         CompletionItemKinds.toIcon = toIcon;
         const data = new Map();
-        data.set('method', 0 /* Method */);
-        data.set('function', 1 /* Function */);
-        data.set('constructor', 2 /* Constructor */);
-        data.set('field', 3 /* Field */);
-        data.set('variable', 4 /* Variable */);
-        data.set('class', 5 /* Class */);
-        data.set('struct', 6 /* Struct */);
-        data.set('interface', 7 /* Interface */);
-        data.set('module', 8 /* Module */);
-        data.set('property', 9 /* Property */);
-        data.set('event', 10 /* Event */);
-        data.set('operator', 11 /* Operator */);
-        data.set('unit', 12 /* Unit */);
-        data.set('value', 13 /* Value */);
-        data.set('constant', 14 /* Constant */);
-        data.set('enum', 15 /* Enum */);
-        data.set('enum-member', 16 /* EnumMember */);
-        data.set('enumMember', 16 /* EnumMember */);
-        data.set('keyword', 17 /* Keyword */);
-        data.set('snippet', 27 /* Snippet */);
-        data.set('text', 18 /* Text */);
-        data.set('color', 19 /* Color */);
-        data.set('file', 20 /* File */);
-        data.set('reference', 21 /* Reference */);
-        data.set('customcolor', 22 /* Customcolor */);
-        data.set('folder', 23 /* Folder */);
-        data.set('type-parameter', 24 /* TypeParameter */);
-        data.set('typeParameter', 24 /* TypeParameter */);
-        data.set('account', 25 /* User */);
-        data.set('issue', 26 /* Issue */);
+        data.set('method', 0 /* CompletionItemKind.Method */);
+        data.set('function', 1 /* CompletionItemKind.Function */);
+        data.set('constructor', 2 /* CompletionItemKind.Constructor */);
+        data.set('field', 3 /* CompletionItemKind.Field */);
+        data.set('variable', 4 /* CompletionItemKind.Variable */);
+        data.set('class', 5 /* CompletionItemKind.Class */);
+        data.set('struct', 6 /* CompletionItemKind.Struct */);
+        data.set('interface', 7 /* CompletionItemKind.Interface */);
+        data.set('module', 8 /* CompletionItemKind.Module */);
+        data.set('property', 9 /* CompletionItemKind.Property */);
+        data.set('event', 10 /* CompletionItemKind.Event */);
+        data.set('operator', 11 /* CompletionItemKind.Operator */);
+        data.set('unit', 12 /* CompletionItemKind.Unit */);
+        data.set('value', 13 /* CompletionItemKind.Value */);
+        data.set('constant', 14 /* CompletionItemKind.Constant */);
+        data.set('enum', 15 /* CompletionItemKind.Enum */);
+        data.set('enum-member', 16 /* CompletionItemKind.EnumMember */);
+        data.set('enumMember', 16 /* CompletionItemKind.EnumMember */);
+        data.set('keyword', 17 /* CompletionItemKind.Keyword */);
+        data.set('snippet', 27 /* CompletionItemKind.Snippet */);
+        data.set('text', 18 /* CompletionItemKind.Text */);
+        data.set('color', 19 /* CompletionItemKind.Color */);
+        data.set('file', 20 /* CompletionItemKind.File */);
+        data.set('reference', 21 /* CompletionItemKind.Reference */);
+        data.set('customcolor', 22 /* CompletionItemKind.Customcolor */);
+        data.set('folder', 23 /* CompletionItemKind.Folder */);
+        data.set('type-parameter', 24 /* CompletionItemKind.TypeParameter */);
+        data.set('typeParameter', 24 /* CompletionItemKind.TypeParameter */);
+        data.set('account', 25 /* CompletionItemKind.User */);
+        data.set('issue', 26 /* CompletionItemKind.Issue */);
         /**
          * @internal
          */
         function fromString(value, strict) {
             let res = data.get(value);
             if (typeof res === 'undefined' && !strict) {
-                res = 9 /* Property */;
+                res = 9 /* CompletionItemKind.Property */;
             }
             return res;
         }
@@ -9302,35 +7914,66 @@
     /**
      * @internal
      */
+    ({
+        [17 /* SymbolKind.Array */]: localize$1('Array', "array"),
+        [16 /* SymbolKind.Boolean */]: localize$1('Boolean', "boolean"),
+        [4 /* SymbolKind.Class */]: localize$1('Class', "class"),
+        [13 /* SymbolKind.Constant */]: localize$1('Constant', "constant"),
+        [8 /* SymbolKind.Constructor */]: localize$1('Constructor', "constructor"),
+        [9 /* SymbolKind.Enum */]: localize$1('Enum', "enumeration"),
+        [21 /* SymbolKind.EnumMember */]: localize$1('EnumMember', "enumeration member"),
+        [23 /* SymbolKind.Event */]: localize$1('Event', "event"),
+        [7 /* SymbolKind.Field */]: localize$1('Field', "field"),
+        [0 /* SymbolKind.File */]: localize$1('File', "file"),
+        [11 /* SymbolKind.Function */]: localize$1('Function', "function"),
+        [10 /* SymbolKind.Interface */]: localize$1('Interface', "interface"),
+        [19 /* SymbolKind.Key */]: localize$1('Key', "key"),
+        [5 /* SymbolKind.Method */]: localize$1('Method', "method"),
+        [1 /* SymbolKind.Module */]: localize$1('Module', "module"),
+        [2 /* SymbolKind.Namespace */]: localize$1('Namespace', "namespace"),
+        [20 /* SymbolKind.Null */]: localize$1('Null', "null"),
+        [15 /* SymbolKind.Number */]: localize$1('Number', "number"),
+        [18 /* SymbolKind.Object */]: localize$1('Object', "object"),
+        [24 /* SymbolKind.Operator */]: localize$1('Operator', "operator"),
+        [3 /* SymbolKind.Package */]: localize$1('Package', "package"),
+        [6 /* SymbolKind.Property */]: localize$1('Property', "property"),
+        [14 /* SymbolKind.String */]: localize$1('String', "string"),
+        [22 /* SymbolKind.Struct */]: localize$1('Struct', "struct"),
+        [25 /* SymbolKind.TypeParameter */]: localize$1('TypeParameter', "type parameter"),
+        [12 /* SymbolKind.Variable */]: localize$1('Variable', "variable"),
+    });
+    /**
+     * @internal
+     */
     var SymbolKinds;
     (function (SymbolKinds) {
         const byKind = new Map();
-        byKind.set(0 /* File */, Codicon.symbolFile);
-        byKind.set(1 /* Module */, Codicon.symbolModule);
-        byKind.set(2 /* Namespace */, Codicon.symbolNamespace);
-        byKind.set(3 /* Package */, Codicon.symbolPackage);
-        byKind.set(4 /* Class */, Codicon.symbolClass);
-        byKind.set(5 /* Method */, Codicon.symbolMethod);
-        byKind.set(6 /* Property */, Codicon.symbolProperty);
-        byKind.set(7 /* Field */, Codicon.symbolField);
-        byKind.set(8 /* Constructor */, Codicon.symbolConstructor);
-        byKind.set(9 /* Enum */, Codicon.symbolEnum);
-        byKind.set(10 /* Interface */, Codicon.symbolInterface);
-        byKind.set(11 /* Function */, Codicon.symbolFunction);
-        byKind.set(12 /* Variable */, Codicon.symbolVariable);
-        byKind.set(13 /* Constant */, Codicon.symbolConstant);
-        byKind.set(14 /* String */, Codicon.symbolString);
-        byKind.set(15 /* Number */, Codicon.symbolNumber);
-        byKind.set(16 /* Boolean */, Codicon.symbolBoolean);
-        byKind.set(17 /* Array */, Codicon.symbolArray);
-        byKind.set(18 /* Object */, Codicon.symbolObject);
-        byKind.set(19 /* Key */, Codicon.symbolKey);
-        byKind.set(20 /* Null */, Codicon.symbolNull);
-        byKind.set(21 /* EnumMember */, Codicon.symbolEnumMember);
-        byKind.set(22 /* Struct */, Codicon.symbolStruct);
-        byKind.set(23 /* Event */, Codicon.symbolEvent);
-        byKind.set(24 /* Operator */, Codicon.symbolOperator);
-        byKind.set(25 /* TypeParameter */, Codicon.symbolTypeParameter);
+        byKind.set(0 /* SymbolKind.File */, Codicon.symbolFile);
+        byKind.set(1 /* SymbolKind.Module */, Codicon.symbolModule);
+        byKind.set(2 /* SymbolKind.Namespace */, Codicon.symbolNamespace);
+        byKind.set(3 /* SymbolKind.Package */, Codicon.symbolPackage);
+        byKind.set(4 /* SymbolKind.Class */, Codicon.symbolClass);
+        byKind.set(5 /* SymbolKind.Method */, Codicon.symbolMethod);
+        byKind.set(6 /* SymbolKind.Property */, Codicon.symbolProperty);
+        byKind.set(7 /* SymbolKind.Field */, Codicon.symbolField);
+        byKind.set(8 /* SymbolKind.Constructor */, Codicon.symbolConstructor);
+        byKind.set(9 /* SymbolKind.Enum */, Codicon.symbolEnum);
+        byKind.set(10 /* SymbolKind.Interface */, Codicon.symbolInterface);
+        byKind.set(11 /* SymbolKind.Function */, Codicon.symbolFunction);
+        byKind.set(12 /* SymbolKind.Variable */, Codicon.symbolVariable);
+        byKind.set(13 /* SymbolKind.Constant */, Codicon.symbolConstant);
+        byKind.set(14 /* SymbolKind.String */, Codicon.symbolString);
+        byKind.set(15 /* SymbolKind.Number */, Codicon.symbolNumber);
+        byKind.set(16 /* SymbolKind.Boolean */, Codicon.symbolBoolean);
+        byKind.set(17 /* SymbolKind.Array */, Codicon.symbolArray);
+        byKind.set(18 /* SymbolKind.Object */, Codicon.symbolObject);
+        byKind.set(19 /* SymbolKind.Key */, Codicon.symbolKey);
+        byKind.set(20 /* SymbolKind.Null */, Codicon.symbolNull);
+        byKind.set(21 /* SymbolKind.EnumMember */, Codicon.symbolEnumMember);
+        byKind.set(22 /* SymbolKind.Struct */, Codicon.symbolStruct);
+        byKind.set(23 /* SymbolKind.Event */, Codicon.symbolEvent);
+        byKind.set(24 /* SymbolKind.Operator */, Codicon.symbolOperator);
+        byKind.set(25 /* SymbolKind.TypeParameter */, Codicon.symbolTypeParameter);
         /**
          * @internal
          */
@@ -9363,119 +8006,9 @@
     })(Command$1 || (Command$1 = {}));
     var InlayHintKind$1;
     (function (InlayHintKind) {
-        InlayHintKind[InlayHintKind["Other"] = 0] = "Other";
         InlayHintKind[InlayHintKind["Type"] = 1] = "Type";
         InlayHintKind[InlayHintKind["Parameter"] = 2] = "Parameter";
     })(InlayHintKind$1 || (InlayHintKind$1 = {}));
-    // --- feature registries ------
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
-    /**
-     * @internal
-     */
-    new LanguageFeatureRegistry();
     /**
      * @internal
      */
@@ -9495,8 +8028,14 @@
         AccessibilitySupport[AccessibilitySupport["Disabled"] = 1] = "Disabled";
         AccessibilitySupport[AccessibilitySupport["Enabled"] = 2] = "Enabled";
     })(AccessibilitySupport || (AccessibilitySupport = {}));
+    var CodeActionTriggerType;
+    (function (CodeActionTriggerType) {
+        CodeActionTriggerType[CodeActionTriggerType["Invoke"] = 1] = "Invoke";
+        CodeActionTriggerType[CodeActionTriggerType["Auto"] = 2] = "Auto";
+    })(CodeActionTriggerType || (CodeActionTriggerType = {}));
     var CompletionItemInsertTextRule;
     (function (CompletionItemInsertTextRule) {
+        CompletionItemInsertTextRule[CompletionItemInsertTextRule["None"] = 0] = "None";
         /**
          * Adjust whitespace/indentation of multiline insert texts to
          * match the current line indentation.
@@ -9653,134 +8192,147 @@
         EditorOption[EditorOption["accessibilitySupport"] = 2] = "accessibilitySupport";
         EditorOption[EditorOption["accessibilityPageSize"] = 3] = "accessibilityPageSize";
         EditorOption[EditorOption["ariaLabel"] = 4] = "ariaLabel";
-        EditorOption[EditorOption["autoClosingBrackets"] = 5] = "autoClosingBrackets";
-        EditorOption[EditorOption["autoClosingDelete"] = 6] = "autoClosingDelete";
-        EditorOption[EditorOption["autoClosingOvertype"] = 7] = "autoClosingOvertype";
-        EditorOption[EditorOption["autoClosingQuotes"] = 8] = "autoClosingQuotes";
-        EditorOption[EditorOption["autoIndent"] = 9] = "autoIndent";
-        EditorOption[EditorOption["automaticLayout"] = 10] = "automaticLayout";
-        EditorOption[EditorOption["autoSurround"] = 11] = "autoSurround";
-        EditorOption[EditorOption["bracketPairColorization"] = 12] = "bracketPairColorization";
-        EditorOption[EditorOption["guides"] = 13] = "guides";
-        EditorOption[EditorOption["codeLens"] = 14] = "codeLens";
-        EditorOption[EditorOption["codeLensFontFamily"] = 15] = "codeLensFontFamily";
-        EditorOption[EditorOption["codeLensFontSize"] = 16] = "codeLensFontSize";
-        EditorOption[EditorOption["colorDecorators"] = 17] = "colorDecorators";
-        EditorOption[EditorOption["columnSelection"] = 18] = "columnSelection";
-        EditorOption[EditorOption["comments"] = 19] = "comments";
-        EditorOption[EditorOption["contextmenu"] = 20] = "contextmenu";
-        EditorOption[EditorOption["copyWithSyntaxHighlighting"] = 21] = "copyWithSyntaxHighlighting";
-        EditorOption[EditorOption["cursorBlinking"] = 22] = "cursorBlinking";
-        EditorOption[EditorOption["cursorSmoothCaretAnimation"] = 23] = "cursorSmoothCaretAnimation";
-        EditorOption[EditorOption["cursorStyle"] = 24] = "cursorStyle";
-        EditorOption[EditorOption["cursorSurroundingLines"] = 25] = "cursorSurroundingLines";
-        EditorOption[EditorOption["cursorSurroundingLinesStyle"] = 26] = "cursorSurroundingLinesStyle";
-        EditorOption[EditorOption["cursorWidth"] = 27] = "cursorWidth";
-        EditorOption[EditorOption["disableLayerHinting"] = 28] = "disableLayerHinting";
-        EditorOption[EditorOption["disableMonospaceOptimizations"] = 29] = "disableMonospaceOptimizations";
-        EditorOption[EditorOption["domReadOnly"] = 30] = "domReadOnly";
-        EditorOption[EditorOption["dragAndDrop"] = 31] = "dragAndDrop";
-        EditorOption[EditorOption["emptySelectionClipboard"] = 32] = "emptySelectionClipboard";
-        EditorOption[EditorOption["extraEditorClassName"] = 33] = "extraEditorClassName";
-        EditorOption[EditorOption["fastScrollSensitivity"] = 34] = "fastScrollSensitivity";
-        EditorOption[EditorOption["find"] = 35] = "find";
-        EditorOption[EditorOption["fixedOverflowWidgets"] = 36] = "fixedOverflowWidgets";
-        EditorOption[EditorOption["folding"] = 37] = "folding";
-        EditorOption[EditorOption["foldingStrategy"] = 38] = "foldingStrategy";
-        EditorOption[EditorOption["foldingHighlight"] = 39] = "foldingHighlight";
-        EditorOption[EditorOption["foldingImportsByDefault"] = 40] = "foldingImportsByDefault";
-        EditorOption[EditorOption["foldingMaximumRegions"] = 41] = "foldingMaximumRegions";
-        EditorOption[EditorOption["unfoldOnClickAfterEndOfLine"] = 42] = "unfoldOnClickAfterEndOfLine";
-        EditorOption[EditorOption["fontFamily"] = 43] = "fontFamily";
-        EditorOption[EditorOption["fontInfo"] = 44] = "fontInfo";
-        EditorOption[EditorOption["fontLigatures"] = 45] = "fontLigatures";
-        EditorOption[EditorOption["fontSize"] = 46] = "fontSize";
-        EditorOption[EditorOption["fontWeight"] = 47] = "fontWeight";
-        EditorOption[EditorOption["formatOnPaste"] = 48] = "formatOnPaste";
-        EditorOption[EditorOption["formatOnType"] = 49] = "formatOnType";
-        EditorOption[EditorOption["glyphMargin"] = 50] = "glyphMargin";
-        EditorOption[EditorOption["gotoLocation"] = 51] = "gotoLocation";
-        EditorOption[EditorOption["hideCursorInOverviewRuler"] = 52] = "hideCursorInOverviewRuler";
-        EditorOption[EditorOption["hover"] = 53] = "hover";
-        EditorOption[EditorOption["inDiffEditor"] = 54] = "inDiffEditor";
-        EditorOption[EditorOption["inlineSuggest"] = 55] = "inlineSuggest";
-        EditorOption[EditorOption["letterSpacing"] = 56] = "letterSpacing";
-        EditorOption[EditorOption["lightbulb"] = 57] = "lightbulb";
-        EditorOption[EditorOption["lineDecorationsWidth"] = 58] = "lineDecorationsWidth";
-        EditorOption[EditorOption["lineHeight"] = 59] = "lineHeight";
-        EditorOption[EditorOption["lineNumbers"] = 60] = "lineNumbers";
-        EditorOption[EditorOption["lineNumbersMinChars"] = 61] = "lineNumbersMinChars";
-        EditorOption[EditorOption["linkedEditing"] = 62] = "linkedEditing";
-        EditorOption[EditorOption["links"] = 63] = "links";
-        EditorOption[EditorOption["matchBrackets"] = 64] = "matchBrackets";
-        EditorOption[EditorOption["minimap"] = 65] = "minimap";
-        EditorOption[EditorOption["mouseStyle"] = 66] = "mouseStyle";
-        EditorOption[EditorOption["mouseWheelScrollSensitivity"] = 67] = "mouseWheelScrollSensitivity";
-        EditorOption[EditorOption["mouseWheelZoom"] = 68] = "mouseWheelZoom";
-        EditorOption[EditorOption["multiCursorMergeOverlapping"] = 69] = "multiCursorMergeOverlapping";
-        EditorOption[EditorOption["multiCursorModifier"] = 70] = "multiCursorModifier";
-        EditorOption[EditorOption["multiCursorPaste"] = 71] = "multiCursorPaste";
-        EditorOption[EditorOption["occurrencesHighlight"] = 72] = "occurrencesHighlight";
-        EditorOption[EditorOption["overviewRulerBorder"] = 73] = "overviewRulerBorder";
-        EditorOption[EditorOption["overviewRulerLanes"] = 74] = "overviewRulerLanes";
-        EditorOption[EditorOption["padding"] = 75] = "padding";
-        EditorOption[EditorOption["parameterHints"] = 76] = "parameterHints";
-        EditorOption[EditorOption["peekWidgetDefaultFocus"] = 77] = "peekWidgetDefaultFocus";
-        EditorOption[EditorOption["definitionLinkOpensInPeek"] = 78] = "definitionLinkOpensInPeek";
-        EditorOption[EditorOption["quickSuggestions"] = 79] = "quickSuggestions";
-        EditorOption[EditorOption["quickSuggestionsDelay"] = 80] = "quickSuggestionsDelay";
-        EditorOption[EditorOption["readOnly"] = 81] = "readOnly";
-        EditorOption[EditorOption["renameOnType"] = 82] = "renameOnType";
-        EditorOption[EditorOption["renderControlCharacters"] = 83] = "renderControlCharacters";
-        EditorOption[EditorOption["renderFinalNewline"] = 84] = "renderFinalNewline";
-        EditorOption[EditorOption["renderLineHighlight"] = 85] = "renderLineHighlight";
-        EditorOption[EditorOption["renderLineHighlightOnlyWhenFocus"] = 86] = "renderLineHighlightOnlyWhenFocus";
-        EditorOption[EditorOption["renderValidationDecorations"] = 87] = "renderValidationDecorations";
-        EditorOption[EditorOption["renderWhitespace"] = 88] = "renderWhitespace";
-        EditorOption[EditorOption["revealHorizontalRightPadding"] = 89] = "revealHorizontalRightPadding";
-        EditorOption[EditorOption["roundedSelection"] = 90] = "roundedSelection";
-        EditorOption[EditorOption["rulers"] = 91] = "rulers";
-        EditorOption[EditorOption["scrollbar"] = 92] = "scrollbar";
-        EditorOption[EditorOption["scrollBeyondLastColumn"] = 93] = "scrollBeyondLastColumn";
-        EditorOption[EditorOption["scrollBeyondLastLine"] = 94] = "scrollBeyondLastLine";
-        EditorOption[EditorOption["scrollPredominantAxis"] = 95] = "scrollPredominantAxis";
-        EditorOption[EditorOption["selectionClipboard"] = 96] = "selectionClipboard";
-        EditorOption[EditorOption["selectionHighlight"] = 97] = "selectionHighlight";
-        EditorOption[EditorOption["selectOnLineNumbers"] = 98] = "selectOnLineNumbers";
-        EditorOption[EditorOption["showFoldingControls"] = 99] = "showFoldingControls";
-        EditorOption[EditorOption["showUnused"] = 100] = "showUnused";
-        EditorOption[EditorOption["snippetSuggestions"] = 101] = "snippetSuggestions";
-        EditorOption[EditorOption["smartSelect"] = 102] = "smartSelect";
-        EditorOption[EditorOption["smoothScrolling"] = 103] = "smoothScrolling";
-        EditorOption[EditorOption["stickyTabStops"] = 104] = "stickyTabStops";
-        EditorOption[EditorOption["stopRenderingLineAfter"] = 105] = "stopRenderingLineAfter";
-        EditorOption[EditorOption["suggest"] = 106] = "suggest";
-        EditorOption[EditorOption["suggestFontSize"] = 107] = "suggestFontSize";
-        EditorOption[EditorOption["suggestLineHeight"] = 108] = "suggestLineHeight";
-        EditorOption[EditorOption["suggestOnTriggerCharacters"] = 109] = "suggestOnTriggerCharacters";
-        EditorOption[EditorOption["suggestSelection"] = 110] = "suggestSelection";
-        EditorOption[EditorOption["tabCompletion"] = 111] = "tabCompletion";
-        EditorOption[EditorOption["tabIndex"] = 112] = "tabIndex";
-        EditorOption[EditorOption["unicodeHighlighting"] = 113] = "unicodeHighlighting";
-        EditorOption[EditorOption["unusualLineTerminators"] = 114] = "unusualLineTerminators";
-        EditorOption[EditorOption["useShadowDOM"] = 115] = "useShadowDOM";
-        EditorOption[EditorOption["useTabStops"] = 116] = "useTabStops";
-        EditorOption[EditorOption["wordSeparators"] = 117] = "wordSeparators";
-        EditorOption[EditorOption["wordWrap"] = 118] = "wordWrap";
-        EditorOption[EditorOption["wordWrapBreakAfterCharacters"] = 119] = "wordWrapBreakAfterCharacters";
-        EditorOption[EditorOption["wordWrapBreakBeforeCharacters"] = 120] = "wordWrapBreakBeforeCharacters";
-        EditorOption[EditorOption["wordWrapColumn"] = 121] = "wordWrapColumn";
-        EditorOption[EditorOption["wordWrapOverride1"] = 122] = "wordWrapOverride1";
-        EditorOption[EditorOption["wordWrapOverride2"] = 123] = "wordWrapOverride2";
-        EditorOption[EditorOption["wrappingIndent"] = 124] = "wrappingIndent";
-        EditorOption[EditorOption["wrappingStrategy"] = 125] = "wrappingStrategy";
-        EditorOption[EditorOption["showDeprecated"] = 126] = "showDeprecated";
-        EditorOption[EditorOption["inlayHints"] = 127] = "inlayHints";
-        EditorOption[EditorOption["editorClassName"] = 128] = "editorClassName";
-        EditorOption[EditorOption["pixelRatio"] = 129] = "pixelRatio";
-        EditorOption[EditorOption["tabFocusMode"] = 130] = "tabFocusMode";
-        EditorOption[EditorOption["layoutInfo"] = 131] = "layoutInfo";
-        EditorOption[EditorOption["wrappingInfo"] = 132] = "wrappingInfo";
+        EditorOption[EditorOption["ariaRequired"] = 5] = "ariaRequired";
+        EditorOption[EditorOption["autoClosingBrackets"] = 6] = "autoClosingBrackets";
+        EditorOption[EditorOption["screenReaderAnnounceInlineSuggestion"] = 7] = "screenReaderAnnounceInlineSuggestion";
+        EditorOption[EditorOption["autoClosingDelete"] = 8] = "autoClosingDelete";
+        EditorOption[EditorOption["autoClosingOvertype"] = 9] = "autoClosingOvertype";
+        EditorOption[EditorOption["autoClosingQuotes"] = 10] = "autoClosingQuotes";
+        EditorOption[EditorOption["autoIndent"] = 11] = "autoIndent";
+        EditorOption[EditorOption["automaticLayout"] = 12] = "automaticLayout";
+        EditorOption[EditorOption["autoSurround"] = 13] = "autoSurround";
+        EditorOption[EditorOption["bracketPairColorization"] = 14] = "bracketPairColorization";
+        EditorOption[EditorOption["guides"] = 15] = "guides";
+        EditorOption[EditorOption["codeLens"] = 16] = "codeLens";
+        EditorOption[EditorOption["codeLensFontFamily"] = 17] = "codeLensFontFamily";
+        EditorOption[EditorOption["codeLensFontSize"] = 18] = "codeLensFontSize";
+        EditorOption[EditorOption["colorDecorators"] = 19] = "colorDecorators";
+        EditorOption[EditorOption["colorDecoratorsLimit"] = 20] = "colorDecoratorsLimit";
+        EditorOption[EditorOption["columnSelection"] = 21] = "columnSelection";
+        EditorOption[EditorOption["comments"] = 22] = "comments";
+        EditorOption[EditorOption["contextmenu"] = 23] = "contextmenu";
+        EditorOption[EditorOption["copyWithSyntaxHighlighting"] = 24] = "copyWithSyntaxHighlighting";
+        EditorOption[EditorOption["cursorBlinking"] = 25] = "cursorBlinking";
+        EditorOption[EditorOption["cursorSmoothCaretAnimation"] = 26] = "cursorSmoothCaretAnimation";
+        EditorOption[EditorOption["cursorStyle"] = 27] = "cursorStyle";
+        EditorOption[EditorOption["cursorSurroundingLines"] = 28] = "cursorSurroundingLines";
+        EditorOption[EditorOption["cursorSurroundingLinesStyle"] = 29] = "cursorSurroundingLinesStyle";
+        EditorOption[EditorOption["cursorWidth"] = 30] = "cursorWidth";
+        EditorOption[EditorOption["disableLayerHinting"] = 31] = "disableLayerHinting";
+        EditorOption[EditorOption["disableMonospaceOptimizations"] = 32] = "disableMonospaceOptimizations";
+        EditorOption[EditorOption["domReadOnly"] = 33] = "domReadOnly";
+        EditorOption[EditorOption["dragAndDrop"] = 34] = "dragAndDrop";
+        EditorOption[EditorOption["dropIntoEditor"] = 35] = "dropIntoEditor";
+        EditorOption[EditorOption["emptySelectionClipboard"] = 36] = "emptySelectionClipboard";
+        EditorOption[EditorOption["experimentalWhitespaceRendering"] = 37] = "experimentalWhitespaceRendering";
+        EditorOption[EditorOption["extraEditorClassName"] = 38] = "extraEditorClassName";
+        EditorOption[EditorOption["fastScrollSensitivity"] = 39] = "fastScrollSensitivity";
+        EditorOption[EditorOption["find"] = 40] = "find";
+        EditorOption[EditorOption["fixedOverflowWidgets"] = 41] = "fixedOverflowWidgets";
+        EditorOption[EditorOption["folding"] = 42] = "folding";
+        EditorOption[EditorOption["foldingStrategy"] = 43] = "foldingStrategy";
+        EditorOption[EditorOption["foldingHighlight"] = 44] = "foldingHighlight";
+        EditorOption[EditorOption["foldingImportsByDefault"] = 45] = "foldingImportsByDefault";
+        EditorOption[EditorOption["foldingMaximumRegions"] = 46] = "foldingMaximumRegions";
+        EditorOption[EditorOption["unfoldOnClickAfterEndOfLine"] = 47] = "unfoldOnClickAfterEndOfLine";
+        EditorOption[EditorOption["fontFamily"] = 48] = "fontFamily";
+        EditorOption[EditorOption["fontInfo"] = 49] = "fontInfo";
+        EditorOption[EditorOption["fontLigatures"] = 50] = "fontLigatures";
+        EditorOption[EditorOption["fontSize"] = 51] = "fontSize";
+        EditorOption[EditorOption["fontWeight"] = 52] = "fontWeight";
+        EditorOption[EditorOption["fontVariations"] = 53] = "fontVariations";
+        EditorOption[EditorOption["formatOnPaste"] = 54] = "formatOnPaste";
+        EditorOption[EditorOption["formatOnType"] = 55] = "formatOnType";
+        EditorOption[EditorOption["glyphMargin"] = 56] = "glyphMargin";
+        EditorOption[EditorOption["gotoLocation"] = 57] = "gotoLocation";
+        EditorOption[EditorOption["hideCursorInOverviewRuler"] = 58] = "hideCursorInOverviewRuler";
+        EditorOption[EditorOption["hover"] = 59] = "hover";
+        EditorOption[EditorOption["inDiffEditor"] = 60] = "inDiffEditor";
+        EditorOption[EditorOption["inlineSuggest"] = 61] = "inlineSuggest";
+        EditorOption[EditorOption["letterSpacing"] = 62] = "letterSpacing";
+        EditorOption[EditorOption["lightbulb"] = 63] = "lightbulb";
+        EditorOption[EditorOption["lineDecorationsWidth"] = 64] = "lineDecorationsWidth";
+        EditorOption[EditorOption["lineHeight"] = 65] = "lineHeight";
+        EditorOption[EditorOption["lineNumbers"] = 66] = "lineNumbers";
+        EditorOption[EditorOption["lineNumbersMinChars"] = 67] = "lineNumbersMinChars";
+        EditorOption[EditorOption["linkedEditing"] = 68] = "linkedEditing";
+        EditorOption[EditorOption["links"] = 69] = "links";
+        EditorOption[EditorOption["matchBrackets"] = 70] = "matchBrackets";
+        EditorOption[EditorOption["minimap"] = 71] = "minimap";
+        EditorOption[EditorOption["mouseStyle"] = 72] = "mouseStyle";
+        EditorOption[EditorOption["mouseWheelScrollSensitivity"] = 73] = "mouseWheelScrollSensitivity";
+        EditorOption[EditorOption["mouseWheelZoom"] = 74] = "mouseWheelZoom";
+        EditorOption[EditorOption["multiCursorMergeOverlapping"] = 75] = "multiCursorMergeOverlapping";
+        EditorOption[EditorOption["multiCursorModifier"] = 76] = "multiCursorModifier";
+        EditorOption[EditorOption["multiCursorPaste"] = 77] = "multiCursorPaste";
+        EditorOption[EditorOption["multiCursorLimit"] = 78] = "multiCursorLimit";
+        EditorOption[EditorOption["occurrencesHighlight"] = 79] = "occurrencesHighlight";
+        EditorOption[EditorOption["overviewRulerBorder"] = 80] = "overviewRulerBorder";
+        EditorOption[EditorOption["overviewRulerLanes"] = 81] = "overviewRulerLanes";
+        EditorOption[EditorOption["padding"] = 82] = "padding";
+        EditorOption[EditorOption["pasteAs"] = 83] = "pasteAs";
+        EditorOption[EditorOption["parameterHints"] = 84] = "parameterHints";
+        EditorOption[EditorOption["peekWidgetDefaultFocus"] = 85] = "peekWidgetDefaultFocus";
+        EditorOption[EditorOption["definitionLinkOpensInPeek"] = 86] = "definitionLinkOpensInPeek";
+        EditorOption[EditorOption["quickSuggestions"] = 87] = "quickSuggestions";
+        EditorOption[EditorOption["quickSuggestionsDelay"] = 88] = "quickSuggestionsDelay";
+        EditorOption[EditorOption["readOnly"] = 89] = "readOnly";
+        EditorOption[EditorOption["readOnlyMessage"] = 90] = "readOnlyMessage";
+        EditorOption[EditorOption["renameOnType"] = 91] = "renameOnType";
+        EditorOption[EditorOption["renderControlCharacters"] = 92] = "renderControlCharacters";
+        EditorOption[EditorOption["renderFinalNewline"] = 93] = "renderFinalNewline";
+        EditorOption[EditorOption["renderLineHighlight"] = 94] = "renderLineHighlight";
+        EditorOption[EditorOption["renderLineHighlightOnlyWhenFocus"] = 95] = "renderLineHighlightOnlyWhenFocus";
+        EditorOption[EditorOption["renderValidationDecorations"] = 96] = "renderValidationDecorations";
+        EditorOption[EditorOption["renderWhitespace"] = 97] = "renderWhitespace";
+        EditorOption[EditorOption["revealHorizontalRightPadding"] = 98] = "revealHorizontalRightPadding";
+        EditorOption[EditorOption["roundedSelection"] = 99] = "roundedSelection";
+        EditorOption[EditorOption["rulers"] = 100] = "rulers";
+        EditorOption[EditorOption["scrollbar"] = 101] = "scrollbar";
+        EditorOption[EditorOption["scrollBeyondLastColumn"] = 102] = "scrollBeyondLastColumn";
+        EditorOption[EditorOption["scrollBeyondLastLine"] = 103] = "scrollBeyondLastLine";
+        EditorOption[EditorOption["scrollPredominantAxis"] = 104] = "scrollPredominantAxis";
+        EditorOption[EditorOption["selectionClipboard"] = 105] = "selectionClipboard";
+        EditorOption[EditorOption["selectionHighlight"] = 106] = "selectionHighlight";
+        EditorOption[EditorOption["selectOnLineNumbers"] = 107] = "selectOnLineNumbers";
+        EditorOption[EditorOption["showFoldingControls"] = 108] = "showFoldingControls";
+        EditorOption[EditorOption["showUnused"] = 109] = "showUnused";
+        EditorOption[EditorOption["snippetSuggestions"] = 110] = "snippetSuggestions";
+        EditorOption[EditorOption["smartSelect"] = 111] = "smartSelect";
+        EditorOption[EditorOption["smoothScrolling"] = 112] = "smoothScrolling";
+        EditorOption[EditorOption["stickyScroll"] = 113] = "stickyScroll";
+        EditorOption[EditorOption["stickyTabStops"] = 114] = "stickyTabStops";
+        EditorOption[EditorOption["stopRenderingLineAfter"] = 115] = "stopRenderingLineAfter";
+        EditorOption[EditorOption["suggest"] = 116] = "suggest";
+        EditorOption[EditorOption["suggestFontSize"] = 117] = "suggestFontSize";
+        EditorOption[EditorOption["suggestLineHeight"] = 118] = "suggestLineHeight";
+        EditorOption[EditorOption["suggestOnTriggerCharacters"] = 119] = "suggestOnTriggerCharacters";
+        EditorOption[EditorOption["suggestSelection"] = 120] = "suggestSelection";
+        EditorOption[EditorOption["tabCompletion"] = 121] = "tabCompletion";
+        EditorOption[EditorOption["tabIndex"] = 122] = "tabIndex";
+        EditorOption[EditorOption["unicodeHighlighting"] = 123] = "unicodeHighlighting";
+        EditorOption[EditorOption["unusualLineTerminators"] = 124] = "unusualLineTerminators";
+        EditorOption[EditorOption["useShadowDOM"] = 125] = "useShadowDOM";
+        EditorOption[EditorOption["useTabStops"] = 126] = "useTabStops";
+        EditorOption[EditorOption["wordBreak"] = 127] = "wordBreak";
+        EditorOption[EditorOption["wordSeparators"] = 128] = "wordSeparators";
+        EditorOption[EditorOption["wordWrap"] = 129] = "wordWrap";
+        EditorOption[EditorOption["wordWrapBreakAfterCharacters"] = 130] = "wordWrapBreakAfterCharacters";
+        EditorOption[EditorOption["wordWrapBreakBeforeCharacters"] = 131] = "wordWrapBreakBeforeCharacters";
+        EditorOption[EditorOption["wordWrapColumn"] = 132] = "wordWrapColumn";
+        EditorOption[EditorOption["wordWrapOverride1"] = 133] = "wordWrapOverride1";
+        EditorOption[EditorOption["wordWrapOverride2"] = 134] = "wordWrapOverride2";
+        EditorOption[EditorOption["wrappingIndent"] = 135] = "wrappingIndent";
+        EditorOption[EditorOption["wrappingStrategy"] = 136] = "wrappingStrategy";
+        EditorOption[EditorOption["showDeprecated"] = 137] = "showDeprecated";
+        EditorOption[EditorOption["inlayHints"] = 138] = "inlayHints";
+        EditorOption[EditorOption["editorClassName"] = 139] = "editorClassName";
+        EditorOption[EditorOption["pixelRatio"] = 140] = "pixelRatio";
+        EditorOption[EditorOption["tabFocusMode"] = 141] = "tabFocusMode";
+        EditorOption[EditorOption["layoutInfo"] = 142] = "layoutInfo";
+        EditorOption[EditorOption["wrappingInfo"] = 143] = "wrappingInfo";
+        EditorOption[EditorOption["defaultColorDecorators"] = 144] = "defaultColorDecorators";
+        EditorOption[EditorOption["colorDecoratorsActivatedOn"] = 145] = "colorDecoratorsActivatedOn";
     })(EditorOption || (EditorOption = {}));
     /**
      * End of line character preference.
@@ -9815,6 +8367,14 @@
         EndOfLineSequence[EndOfLineSequence["CRLF"] = 1] = "CRLF";
     })(EndOfLineSequence || (EndOfLineSequence = {}));
     /**
+     * Vertical Lane in the glyph margin of the editor.
+     */
+    var GlyphMarginLane$1;
+    (function (GlyphMarginLane) {
+        GlyphMarginLane[GlyphMarginLane["Left"] = 1] = "Left";
+        GlyphMarginLane[GlyphMarginLane["Right"] = 2] = "Right";
+    })(GlyphMarginLane$1 || (GlyphMarginLane$1 = {}));
+    /**
      * Describes what to do with the indentation when pressing Enter.
      */
     var IndentAction;
@@ -9838,16 +8398,15 @@
          */
         IndentAction[IndentAction["Outdent"] = 3] = "Outdent";
     })(IndentAction || (IndentAction = {}));
-    var InjectedTextCursorStops;
+    var InjectedTextCursorStops$1;
     (function (InjectedTextCursorStops) {
         InjectedTextCursorStops[InjectedTextCursorStops["Both"] = 0] = "Both";
         InjectedTextCursorStops[InjectedTextCursorStops["Right"] = 1] = "Right";
         InjectedTextCursorStops[InjectedTextCursorStops["Left"] = 2] = "Left";
         InjectedTextCursorStops[InjectedTextCursorStops["None"] = 3] = "None";
-    })(InjectedTextCursorStops || (InjectedTextCursorStops = {}));
+    })(InjectedTextCursorStops$1 || (InjectedTextCursorStops$1 = {}));
     var InlayHintKind;
     (function (InlayHintKind) {
-        InlayHintKind[InlayHintKind["Other"] = 0] = "Other";
         InlayHintKind[InlayHintKind["Type"] = 1] = "Type";
         InlayHintKind[InlayHintKind["Parameter"] = 2] = "Parameter";
     })(InlayHintKind || (InlayHintKind = {}));
@@ -9956,112 +8515,121 @@
         KeyCode[KeyCode["F17"] = 75] = "F17";
         KeyCode[KeyCode["F18"] = 76] = "F18";
         KeyCode[KeyCode["F19"] = 77] = "F19";
-        KeyCode[KeyCode["NumLock"] = 78] = "NumLock";
-        KeyCode[KeyCode["ScrollLock"] = 79] = "ScrollLock";
+        KeyCode[KeyCode["F20"] = 78] = "F20";
+        KeyCode[KeyCode["F21"] = 79] = "F21";
+        KeyCode[KeyCode["F22"] = 80] = "F22";
+        KeyCode[KeyCode["F23"] = 81] = "F23";
+        KeyCode[KeyCode["F24"] = 82] = "F24";
+        KeyCode[KeyCode["NumLock"] = 83] = "NumLock";
+        KeyCode[KeyCode["ScrollLock"] = 84] = "ScrollLock";
         /**
          * Used for miscellaneous characters; it can vary by keyboard.
          * For the US standard keyboard, the ';:' key
          */
-        KeyCode[KeyCode["Semicolon"] = 80] = "Semicolon";
+        KeyCode[KeyCode["Semicolon"] = 85] = "Semicolon";
         /**
          * For any country/region, the '+' key
          * For the US standard keyboard, the '=+' key
          */
-        KeyCode[KeyCode["Equal"] = 81] = "Equal";
+        KeyCode[KeyCode["Equal"] = 86] = "Equal";
         /**
          * For any country/region, the ',' key
          * For the US standard keyboard, the ',<' key
          */
-        KeyCode[KeyCode["Comma"] = 82] = "Comma";
+        KeyCode[KeyCode["Comma"] = 87] = "Comma";
         /**
          * For any country/region, the '-' key
          * For the US standard keyboard, the '-_' key
          */
-        KeyCode[KeyCode["Minus"] = 83] = "Minus";
+        KeyCode[KeyCode["Minus"] = 88] = "Minus";
         /**
          * For any country/region, the '.' key
          * For the US standard keyboard, the '.>' key
          */
-        KeyCode[KeyCode["Period"] = 84] = "Period";
+        KeyCode[KeyCode["Period"] = 89] = "Period";
         /**
          * Used for miscellaneous characters; it can vary by keyboard.
          * For the US standard keyboard, the '/?' key
          */
-        KeyCode[KeyCode["Slash"] = 85] = "Slash";
+        KeyCode[KeyCode["Slash"] = 90] = "Slash";
         /**
          * Used for miscellaneous characters; it can vary by keyboard.
          * For the US standard keyboard, the '`~' key
          */
-        KeyCode[KeyCode["Backquote"] = 86] = "Backquote";
+        KeyCode[KeyCode["Backquote"] = 91] = "Backquote";
         /**
          * Used for miscellaneous characters; it can vary by keyboard.
          * For the US standard keyboard, the '[{' key
          */
-        KeyCode[KeyCode["BracketLeft"] = 87] = "BracketLeft";
+        KeyCode[KeyCode["BracketLeft"] = 92] = "BracketLeft";
         /**
          * Used for miscellaneous characters; it can vary by keyboard.
          * For the US standard keyboard, the '\|' key
          */
-        KeyCode[KeyCode["Backslash"] = 88] = "Backslash";
+        KeyCode[KeyCode["Backslash"] = 93] = "Backslash";
         /**
          * Used for miscellaneous characters; it can vary by keyboard.
          * For the US standard keyboard, the ']}' key
          */
-        KeyCode[KeyCode["BracketRight"] = 89] = "BracketRight";
+        KeyCode[KeyCode["BracketRight"] = 94] = "BracketRight";
         /**
          * Used for miscellaneous characters; it can vary by keyboard.
          * For the US standard keyboard, the ''"' key
          */
-        KeyCode[KeyCode["Quote"] = 90] = "Quote";
+        KeyCode[KeyCode["Quote"] = 95] = "Quote";
         /**
          * Used for miscellaneous characters; it can vary by keyboard.
          */
-        KeyCode[KeyCode["OEM_8"] = 91] = "OEM_8";
+        KeyCode[KeyCode["OEM_8"] = 96] = "OEM_8";
         /**
          * Either the angle bracket key or the backslash key on the RT 102-key keyboard.
          */
-        KeyCode[KeyCode["IntlBackslash"] = 92] = "IntlBackslash";
-        KeyCode[KeyCode["Numpad0"] = 93] = "Numpad0";
-        KeyCode[KeyCode["Numpad1"] = 94] = "Numpad1";
-        KeyCode[KeyCode["Numpad2"] = 95] = "Numpad2";
-        KeyCode[KeyCode["Numpad3"] = 96] = "Numpad3";
-        KeyCode[KeyCode["Numpad4"] = 97] = "Numpad4";
-        KeyCode[KeyCode["Numpad5"] = 98] = "Numpad5";
-        KeyCode[KeyCode["Numpad6"] = 99] = "Numpad6";
-        KeyCode[KeyCode["Numpad7"] = 100] = "Numpad7";
-        KeyCode[KeyCode["Numpad8"] = 101] = "Numpad8";
-        KeyCode[KeyCode["Numpad9"] = 102] = "Numpad9";
-        KeyCode[KeyCode["NumpadMultiply"] = 103] = "NumpadMultiply";
-        KeyCode[KeyCode["NumpadAdd"] = 104] = "NumpadAdd";
-        KeyCode[KeyCode["NUMPAD_SEPARATOR"] = 105] = "NUMPAD_SEPARATOR";
-        KeyCode[KeyCode["NumpadSubtract"] = 106] = "NumpadSubtract";
-        KeyCode[KeyCode["NumpadDecimal"] = 107] = "NumpadDecimal";
-        KeyCode[KeyCode["NumpadDivide"] = 108] = "NumpadDivide";
+        KeyCode[KeyCode["IntlBackslash"] = 97] = "IntlBackslash";
+        KeyCode[KeyCode["Numpad0"] = 98] = "Numpad0";
+        KeyCode[KeyCode["Numpad1"] = 99] = "Numpad1";
+        KeyCode[KeyCode["Numpad2"] = 100] = "Numpad2";
+        KeyCode[KeyCode["Numpad3"] = 101] = "Numpad3";
+        KeyCode[KeyCode["Numpad4"] = 102] = "Numpad4";
+        KeyCode[KeyCode["Numpad5"] = 103] = "Numpad5";
+        KeyCode[KeyCode["Numpad6"] = 104] = "Numpad6";
+        KeyCode[KeyCode["Numpad7"] = 105] = "Numpad7";
+        KeyCode[KeyCode["Numpad8"] = 106] = "Numpad8";
+        KeyCode[KeyCode["Numpad9"] = 107] = "Numpad9";
+        KeyCode[KeyCode["NumpadMultiply"] = 108] = "NumpadMultiply";
+        KeyCode[KeyCode["NumpadAdd"] = 109] = "NumpadAdd";
+        KeyCode[KeyCode["NUMPAD_SEPARATOR"] = 110] = "NUMPAD_SEPARATOR";
+        KeyCode[KeyCode["NumpadSubtract"] = 111] = "NumpadSubtract";
+        KeyCode[KeyCode["NumpadDecimal"] = 112] = "NumpadDecimal";
+        KeyCode[KeyCode["NumpadDivide"] = 113] = "NumpadDivide";
         /**
          * Cover all key codes when IME is processing input.
          */
-        KeyCode[KeyCode["KEY_IN_COMPOSITION"] = 109] = "KEY_IN_COMPOSITION";
-        KeyCode[KeyCode["ABNT_C1"] = 110] = "ABNT_C1";
-        KeyCode[KeyCode["ABNT_C2"] = 111] = "ABNT_C2";
-        KeyCode[KeyCode["AudioVolumeMute"] = 112] = "AudioVolumeMute";
-        KeyCode[KeyCode["AudioVolumeUp"] = 113] = "AudioVolumeUp";
-        KeyCode[KeyCode["AudioVolumeDown"] = 114] = "AudioVolumeDown";
-        KeyCode[KeyCode["BrowserSearch"] = 115] = "BrowserSearch";
-        KeyCode[KeyCode["BrowserHome"] = 116] = "BrowserHome";
-        KeyCode[KeyCode["BrowserBack"] = 117] = "BrowserBack";
-        KeyCode[KeyCode["BrowserForward"] = 118] = "BrowserForward";
-        KeyCode[KeyCode["MediaTrackNext"] = 119] = "MediaTrackNext";
-        KeyCode[KeyCode["MediaTrackPrevious"] = 120] = "MediaTrackPrevious";
-        KeyCode[KeyCode["MediaStop"] = 121] = "MediaStop";
-        KeyCode[KeyCode["MediaPlayPause"] = 122] = "MediaPlayPause";
-        KeyCode[KeyCode["LaunchMediaPlayer"] = 123] = "LaunchMediaPlayer";
-        KeyCode[KeyCode["LaunchMail"] = 124] = "LaunchMail";
-        KeyCode[KeyCode["LaunchApp2"] = 125] = "LaunchApp2";
+        KeyCode[KeyCode["KEY_IN_COMPOSITION"] = 114] = "KEY_IN_COMPOSITION";
+        KeyCode[KeyCode["ABNT_C1"] = 115] = "ABNT_C1";
+        KeyCode[KeyCode["ABNT_C2"] = 116] = "ABNT_C2";
+        KeyCode[KeyCode["AudioVolumeMute"] = 117] = "AudioVolumeMute";
+        KeyCode[KeyCode["AudioVolumeUp"] = 118] = "AudioVolumeUp";
+        KeyCode[KeyCode["AudioVolumeDown"] = 119] = "AudioVolumeDown";
+        KeyCode[KeyCode["BrowserSearch"] = 120] = "BrowserSearch";
+        KeyCode[KeyCode["BrowserHome"] = 121] = "BrowserHome";
+        KeyCode[KeyCode["BrowserBack"] = 122] = "BrowserBack";
+        KeyCode[KeyCode["BrowserForward"] = 123] = "BrowserForward";
+        KeyCode[KeyCode["MediaTrackNext"] = 124] = "MediaTrackNext";
+        KeyCode[KeyCode["MediaTrackPrevious"] = 125] = "MediaTrackPrevious";
+        KeyCode[KeyCode["MediaStop"] = 126] = "MediaStop";
+        KeyCode[KeyCode["MediaPlayPause"] = 127] = "MediaPlayPause";
+        KeyCode[KeyCode["LaunchMediaPlayer"] = 128] = "LaunchMediaPlayer";
+        KeyCode[KeyCode["LaunchMail"] = 129] = "LaunchMail";
+        KeyCode[KeyCode["LaunchApp2"] = 130] = "LaunchApp2";
+        /**
+         * VK_CLEAR, 0x0C, CLEAR key
+         */
+        KeyCode[KeyCode["Clear"] = 131] = "Clear";
         /**
          * Placed last to cover the length of the enum.
          * Please do not depend on this value!
          */
-        KeyCode[KeyCode["MAX_VALUE"] = 126] = "MAX_VALUE";
+        KeyCode[KeyCode["MAX_VALUE"] = 132] = "MAX_VALUE";
     })(KeyCode || (KeyCode = {}));
     var MarkerSeverity;
     (function (MarkerSeverity) {
@@ -10078,11 +8646,11 @@
     /**
      * Position in the minimap to render the decoration.
      */
-    var MinimapPosition;
+    var MinimapPosition$1;
     (function (MinimapPosition) {
         MinimapPosition[MinimapPosition["Inline"] = 1] = "Inline";
         MinimapPosition[MinimapPosition["Gutter"] = 2] = "Gutter";
-    })(MinimapPosition || (MinimapPosition = {}));
+    })(MinimapPosition$1 || (MinimapPosition$1 = {}));
     /**
      * Type of hit element with the mouse in the editor.
      */
@@ -10166,13 +8734,13 @@
     /**
      * Vertical Lane in the overview ruler of the editor.
      */
-    var OverviewRulerLane;
+    var OverviewRulerLane$1;
     (function (OverviewRulerLane) {
         OverviewRulerLane[OverviewRulerLane["Left"] = 1] = "Left";
         OverviewRulerLane[OverviewRulerLane["Center"] = 2] = "Center";
         OverviewRulerLane[OverviewRulerLane["Right"] = 4] = "Right";
         OverviewRulerLane[OverviewRulerLane["Full"] = 7] = "Full";
-    })(OverviewRulerLane || (OverviewRulerLane = {}));
+    })(OverviewRulerLane$1 || (OverviewRulerLane$1 = {}));
     var PositionAffinity;
     (function (PositionAffinity) {
         /**
@@ -10187,6 +8755,14 @@
          * No preference.
         */
         PositionAffinity[PositionAffinity["None"] = 2] = "None";
+        /**
+         * If the given position is on injected text, prefers the position left of it.
+        */
+        PositionAffinity[PositionAffinity["LeftOfInjectedText"] = 3] = "LeftOfInjectedText";
+        /**
+         * If the given position is on injected text, prefers the position right of it.
+        */
+        PositionAffinity[PositionAffinity["RightOfInjectedText"] = 4] = "RightOfInjectedText";
     })(PositionAffinity || (PositionAffinity = {}));
     var RenderLineNumbersType;
     (function (RenderLineNumbersType) {
@@ -10372,10 +8948,10 @@
             return KeyChord(firstPart, secondPart);
         }
     }
-    KeyMod.CtrlCmd = 2048 /* CtrlCmd */;
-    KeyMod.Shift = 1024 /* Shift */;
-    KeyMod.Alt = 512 /* Alt */;
-    KeyMod.WinCtrl = 256 /* WinCtrl */;
+    KeyMod.CtrlCmd = 2048 /* ConstKeyMod.CtrlCmd */;
+    KeyMod.Shift = 1024 /* ConstKeyMod.Shift */;
+    KeyMod.Alt = 512 /* ConstKeyMod.Alt */;
+    KeyMod.WinCtrl = 256 /* ConstKeyMod.WinCtrl */;
     function createMonacoBaseAPI() {
         return {
             editor: undefined,
@@ -10399,23 +8975,61 @@
      *  Copyright (c) Microsoft Corporation. All rights reserved.
      *  Licensed under the MIT License. See License.txt in the project root for license information.
      *--------------------------------------------------------------------------------------------*/
+    /**
+     * Vertical Lane in the overview ruler of the editor.
+     */
+    var OverviewRulerLane;
+    (function (OverviewRulerLane) {
+        OverviewRulerLane[OverviewRulerLane["Left"] = 1] = "Left";
+        OverviewRulerLane[OverviewRulerLane["Center"] = 2] = "Center";
+        OverviewRulerLane[OverviewRulerLane["Right"] = 4] = "Right";
+        OverviewRulerLane[OverviewRulerLane["Full"] = 7] = "Full";
+    })(OverviewRulerLane || (OverviewRulerLane = {}));
+    /**
+     * Vertical Lane in the glyph margin of the editor.
+     */
+    var GlyphMarginLane;
+    (function (GlyphMarginLane) {
+        GlyphMarginLane[GlyphMarginLane["Left"] = 1] = "Left";
+        GlyphMarginLane[GlyphMarginLane["Right"] = 2] = "Right";
+    })(GlyphMarginLane || (GlyphMarginLane = {}));
+    /**
+     * Position in the minimap to render the decoration.
+     */
+    var MinimapPosition;
+    (function (MinimapPosition) {
+        MinimapPosition[MinimapPosition["Inline"] = 1] = "Inline";
+        MinimapPosition[MinimapPosition["Gutter"] = 2] = "Gutter";
+    })(MinimapPosition || (MinimapPosition = {}));
+    var InjectedTextCursorStops;
+    (function (InjectedTextCursorStops) {
+        InjectedTextCursorStops[InjectedTextCursorStops["Both"] = 0] = "Both";
+        InjectedTextCursorStops[InjectedTextCursorStops["Right"] = 1] = "Right";
+        InjectedTextCursorStops[InjectedTextCursorStops["Left"] = 2] = "Left";
+        InjectedTextCursorStops[InjectedTextCursorStops["None"] = 3] = "None";
+    })(InjectedTextCursorStops || (InjectedTextCursorStops = {}));
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
     function leftIsWordBounday(wordSeparators, text, textLength, matchStartIndex, matchLength) {
         if (matchStartIndex === 0) {
             // Match starts at start of string
             return true;
         }
         const charBefore = text.charCodeAt(matchStartIndex - 1);
-        if (wordSeparators.get(charBefore) !== 0 /* Regular */) {
+        if (wordSeparators.get(charBefore) !== 0 /* WordCharacterClass.Regular */) {
             // The character before the match is a word separator
             return true;
         }
-        if (charBefore === 13 /* CarriageReturn */ || charBefore === 10 /* LineFeed */) {
+        if (charBefore === 13 /* CharCode.CarriageReturn */ || charBefore === 10 /* CharCode.LineFeed */) {
             // The character before the match is line break or carriage return.
             return true;
         }
         if (matchLength > 0) {
             const firstCharInMatch = text.charCodeAt(matchStartIndex);
-            if (wordSeparators.get(firstCharInMatch) !== 0 /* Regular */) {
+            if (wordSeparators.get(firstCharInMatch) !== 0 /* WordCharacterClass.Regular */) {
                 // The first character inside the match is a word separator
                 return true;
             }
@@ -10428,17 +9042,17 @@
             return true;
         }
         const charAfter = text.charCodeAt(matchStartIndex + matchLength);
-        if (wordSeparators.get(charAfter) !== 0 /* Regular */) {
+        if (wordSeparators.get(charAfter) !== 0 /* WordCharacterClass.Regular */) {
             // The character after the match is a word separator
             return true;
         }
-        if (charAfter === 13 /* CarriageReturn */ || charAfter === 10 /* LineFeed */) {
+        if (charAfter === 13 /* CharCode.CarriageReturn */ || charAfter === 10 /* CharCode.LineFeed */) {
             // The character after the match is line break or carriage return.
             return true;
         }
         if (matchLength > 0) {
             const lastCharInMatch = text.charCodeAt(matchStartIndex + matchLength - 1);
-            if (wordSeparators.get(lastCharInMatch) !== 0 /* Regular */) {
+            if (wordSeparators.get(lastCharInMatch) !== 0 /* WordCharacterClass.Regular */) {
                 // The last character in the match is a word separator
                 return true;
             }
@@ -10504,6 +9118,38 @@
      *  Copyright (c) Microsoft Corporation. All rights reserved.
      *  Licensed under the MIT License. See License.txt in the project root for license information.
      *--------------------------------------------------------------------------------------------*/
+    function assertNever(value, message = 'Unreachable') {
+        throw new Error(message);
+    }
+    /**
+     * condition must be side-effect free!
+     */
+    function assertFn(condition) {
+        if (!condition()) {
+            // eslint-disable-next-line no-debugger
+            debugger;
+            // Reevaluate `condition` again to make debugging easier
+            condition();
+            onUnexpectedError(new BugIndicatingError('Assertion Failed'));
+        }
+    }
+    function checkAdjacentItems(items, predicate) {
+        let i = 0;
+        while (i < items.length - 1) {
+            const a = items[i];
+            const b = items[i + 1];
+            if (!predicate(a, b)) {
+                return false;
+            }
+            i++;
+        }
+        return true;
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
     class UnicodeTextModelHighlighter {
         static computeUnicodeHighlights(model, options, range) {
             const startLine = range ? range.startLineNumber : 1;
@@ -10548,15 +9194,20 @@
                             }
                         }
                         const str = lineContent.substring(startIndex, endIndex);
-                        const highlightReason = codePointHighlighter.shouldHighlightNonBasicASCII(str);
-                        if (highlightReason !== 0 /* None */) {
-                            if (highlightReason === 3 /* Ambiguous */) {
+                        let word = getWordAtText(startIndex + 1, DEFAULT_WORD_REGEXP, lineContent, 0);
+                        if (word && word.endColumn <= startIndex + 1) {
+                            // The word does not include the problematic character, ignore the word
+                            word = null;
+                        }
+                        const highlightReason = codePointHighlighter.shouldHighlightNonBasicASCII(str, word ? word.word : null);
+                        if (highlightReason !== 0 /* SimpleHighlightReason.None */) {
+                            if (highlightReason === 3 /* SimpleHighlightReason.Ambiguous */) {
                                 ambiguousCharacterCount++;
                             }
-                            else if (highlightReason === 2 /* Invisible */) {
+                            else if (highlightReason === 2 /* SimpleHighlightReason.Invisible */) {
                                 invisibleCharacterCount++;
                             }
-                            else if (highlightReason === 1 /* NonBasicASCII */) {
+                            else if (highlightReason === 1 /* SimpleHighlightReason.NonBasicASCII */) {
                                 nonBasicAsciiCharacterCount++;
                             }
                             else {
@@ -10582,20 +9233,20 @@
         }
         static computeUnicodeHighlightReason(char, options) {
             const codePointHighlighter = new CodePointHighlighter(options);
-            const reason = codePointHighlighter.shouldHighlightNonBasicASCII(char);
+            const reason = codePointHighlighter.shouldHighlightNonBasicASCII(char, null);
             switch (reason) {
-                case 0 /* None */:
+                case 0 /* SimpleHighlightReason.None */:
                     return null;
-                case 2 /* Invisible */:
-                    return { kind: 1 /* Invisible */ };
-                case 3 /* Ambiguous */: {
+                case 2 /* SimpleHighlightReason.Invisible */:
+                    return { kind: 1 /* UnicodeHighlighterReasonKind.Invisible */ };
+                case 3 /* SimpleHighlightReason.Ambiguous */: {
                     const codePoint = char.codePointAt(0);
                     const primaryConfusable = codePointHighlighter.ambiguousCharacters.getPrimaryConfusable(codePoint);
                     const notAmbiguousInLocales = AmbiguousCharacters.getLocales().filter((l) => !AmbiguousCharacters.getInstance(new Set([...options.allowedLocales, l])).isAmbiguous(codePoint));
-                    return { kind: 0 /* Ambiguous */, confusableWith: String.fromCodePoint(primaryConfusable), notAmbiguousInLocales };
+                    return { kind: 0 /* UnicodeHighlighterReasonKind.Ambiguous */, confusableWith: String.fromCodePoint(primaryConfusable), notAmbiguousInLocales };
                 }
-                case 1 /* NonBasicASCII */:
-                    return { kind: 2 /* NonBasicAscii */ };
+                case 1 /* SimpleHighlightReason.NonBasicASCII */:
+                    return { kind: 2 /* UnicodeHighlighterReasonKind.NonBasicAscii */ };
             }
         }
     }
@@ -10616,7 +9267,9 @@
             const set = new Set();
             if (this.options.invisibleCharacters) {
                 for (const cp of InvisibleCharacters.codePoints) {
-                    set.add(cp);
+                    if (!isAllowedInvisibleCharacter(String.fromCodePoint(cp))) {
+                        set.add(cp);
+                    }
                 }
             }
             if (this.options.ambiguousCharacters) {
@@ -10629,28 +9282,2612 @@
             }
             return set;
         }
-        shouldHighlightNonBasicASCII(character) {
+        shouldHighlightNonBasicASCII(character, wordContext) {
             const codePoint = character.codePointAt(0);
             if (this.allowedCodePoints.has(codePoint)) {
-                return 0 /* None */;
+                return 0 /* SimpleHighlightReason.None */;
             }
             if (this.options.nonBasicASCII) {
-                return 1 /* NonBasicASCII */;
+                return 1 /* SimpleHighlightReason.NonBasicASCII */;
+            }
+            let hasBasicASCIICharacters = false;
+            let hasNonConfusableNonBasicAsciiCharacter = false;
+            if (wordContext) {
+                for (const char of wordContext) {
+                    const codePoint = char.codePointAt(0);
+                    const isBasicASCII$1 = isBasicASCII(char);
+                    hasBasicASCIICharacters = hasBasicASCIICharacters || isBasicASCII$1;
+                    if (!isBasicASCII$1 &&
+                        !this.ambiguousCharacters.isAmbiguous(codePoint) &&
+                        !InvisibleCharacters.isInvisibleCharacter(codePoint)) {
+                        hasNonConfusableNonBasicAsciiCharacter = true;
+                    }
+                }
+            }
+            if (
+            /* Don't allow mixing weird looking characters with ASCII */ !hasBasicASCIICharacters &&
+                /* Is there an obviously weird looking character? */ hasNonConfusableNonBasicAsciiCharacter) {
+                return 0 /* SimpleHighlightReason.None */;
             }
             if (this.options.invisibleCharacters) {
-                const isAllowedInvisibleCharacter = character === ' ' || character === '\n' || character === '\t';
                 // TODO check for emojis
-                if (!isAllowedInvisibleCharacter && InvisibleCharacters.isInvisibleCharacter(codePoint)) {
-                    return 2 /* Invisible */;
+                if (!isAllowedInvisibleCharacter(character) && InvisibleCharacters.isInvisibleCharacter(codePoint)) {
+                    return 2 /* SimpleHighlightReason.Invisible */;
                 }
             }
             if (this.options.ambiguousCharacters) {
                 if (this.ambiguousCharacters.isAmbiguous(codePoint)) {
-                    return 3 /* Ambiguous */;
+                    return 3 /* SimpleHighlightReason.Ambiguous */;
                 }
             }
-            return 0 /* None */;
+            return 0 /* SimpleHighlightReason.None */;
         }
+    }
+    function isAllowedInvisibleCharacter(character) {
+        return character === ' ' || character === '\n' || character === '\t';
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    /**
+     * A range of lines (1-based).
+     */
+    class LineRange {
+        static fromRange(range) {
+            return new LineRange(range.startLineNumber, range.endLineNumber);
+        }
+        static subtract(a, b) {
+            if (!b) {
+                return [a];
+            }
+            if (a.startLineNumber < b.startLineNumber && b.endLineNumberExclusive < a.endLineNumberExclusive) {
+                return [
+                    new LineRange(a.startLineNumber, b.startLineNumber),
+                    new LineRange(b.endLineNumberExclusive, a.endLineNumberExclusive)
+                ];
+            }
+            else if (b.startLineNumber <= a.startLineNumber && a.endLineNumberExclusive <= b.endLineNumberExclusive) {
+                return [];
+            }
+            else if (b.endLineNumberExclusive < a.endLineNumberExclusive) {
+                return [new LineRange(Math.max(b.endLineNumberExclusive, a.startLineNumber), a.endLineNumberExclusive)];
+            }
+            else {
+                return [new LineRange(a.startLineNumber, Math.min(b.startLineNumber, a.endLineNumberExclusive))];
+            }
+        }
+        /**
+         * @param lineRanges An array of sorted line ranges.
+         */
+        static joinMany(lineRanges) {
+            if (lineRanges.length === 0) {
+                return [];
+            }
+            let result = lineRanges[0];
+            for (let i = 1; i < lineRanges.length; i++) {
+                result = this.join(result, lineRanges[i]);
+            }
+            return result;
+        }
+        /**
+         * @param lineRanges1 Must be sorted.
+         * @param lineRanges2 Must be sorted.
+         */
+        static join(lineRanges1, lineRanges2) {
+            if (lineRanges1.length === 0) {
+                return lineRanges2;
+            }
+            if (lineRanges2.length === 0) {
+                return lineRanges1;
+            }
+            const result = [];
+            let i1 = 0;
+            let i2 = 0;
+            let current = null;
+            while (i1 < lineRanges1.length || i2 < lineRanges2.length) {
+                let next = null;
+                if (i1 < lineRanges1.length && i2 < lineRanges2.length) {
+                    const lineRange1 = lineRanges1[i1];
+                    const lineRange2 = lineRanges2[i2];
+                    if (lineRange1.startLineNumber < lineRange2.startLineNumber) {
+                        next = lineRange1;
+                        i1++;
+                    }
+                    else {
+                        next = lineRange2;
+                        i2++;
+                    }
+                }
+                else if (i1 < lineRanges1.length) {
+                    next = lineRanges1[i1];
+                    i1++;
+                }
+                else {
+                    next = lineRanges2[i2];
+                    i2++;
+                }
+                if (current === null) {
+                    current = next;
+                }
+                else {
+                    if (current.endLineNumberExclusive >= next.startLineNumber) {
+                        // merge
+                        current = new LineRange(current.startLineNumber, Math.max(current.endLineNumberExclusive, next.endLineNumberExclusive));
+                    }
+                    else {
+                        // push
+                        result.push(current);
+                        current = next;
+                    }
+                }
+            }
+            if (current !== null) {
+                result.push(current);
+            }
+            return result;
+        }
+        static ofLength(startLineNumber, length) {
+            return new LineRange(startLineNumber, startLineNumber + length);
+        }
+        /**
+         * @internal
+         */
+        static deserialize(lineRange) {
+            return new LineRange(lineRange[0], lineRange[1]);
+        }
+        constructor(startLineNumber, endLineNumberExclusive) {
+            if (startLineNumber > endLineNumberExclusive) {
+                throw new BugIndicatingError(`startLineNumber ${startLineNumber} cannot be after endLineNumberExclusive ${endLineNumberExclusive}`);
+            }
+            this.startLineNumber = startLineNumber;
+            this.endLineNumberExclusive = endLineNumberExclusive;
+        }
+        /**
+         * Indicates if this line range contains the given line number.
+         */
+        contains(lineNumber) {
+            return this.startLineNumber <= lineNumber && lineNumber < this.endLineNumberExclusive;
+        }
+        /**
+         * Indicates if this line range is empty.
+         */
+        get isEmpty() {
+            return this.startLineNumber === this.endLineNumberExclusive;
+        }
+        /**
+         * Moves this line range by the given offset of line numbers.
+         */
+        delta(offset) {
+            return new LineRange(this.startLineNumber + offset, this.endLineNumberExclusive + offset);
+        }
+        /**
+         * The number of lines this line range spans.
+         */
+        get length() {
+            return this.endLineNumberExclusive - this.startLineNumber;
+        }
+        /**
+         * Creates a line range that combines this and the given line range.
+         */
+        join(other) {
+            return new LineRange(Math.min(this.startLineNumber, other.startLineNumber), Math.max(this.endLineNumberExclusive, other.endLineNumberExclusive));
+        }
+        toString() {
+            return `[${this.startLineNumber},${this.endLineNumberExclusive})`;
+        }
+        /**
+         * The resulting range is empty if the ranges do not intersect, but touch.
+         * If the ranges don't even touch, the result is undefined.
+         */
+        intersect(other) {
+            const startLineNumber = Math.max(this.startLineNumber, other.startLineNumber);
+            const endLineNumberExclusive = Math.min(this.endLineNumberExclusive, other.endLineNumberExclusive);
+            if (startLineNumber <= endLineNumberExclusive) {
+                return new LineRange(startLineNumber, endLineNumberExclusive);
+            }
+            return undefined;
+        }
+        intersectsStrict(other) {
+            return this.startLineNumber < other.endLineNumberExclusive && other.startLineNumber < this.endLineNumberExclusive;
+        }
+        overlapOrTouch(other) {
+            return this.startLineNumber <= other.endLineNumberExclusive && other.startLineNumber <= this.endLineNumberExclusive;
+        }
+        equals(b) {
+            return this.startLineNumber === b.startLineNumber && this.endLineNumberExclusive === b.endLineNumberExclusive;
+        }
+        toInclusiveRange() {
+            if (this.isEmpty) {
+                return null;
+            }
+            return new Range$1(this.startLineNumber, 1, this.endLineNumberExclusive - 1, Number.MAX_SAFE_INTEGER);
+        }
+        toExclusiveRange() {
+            return new Range$1(this.startLineNumber, 1, this.endLineNumberExclusive, 1);
+        }
+        mapToLineArray(f) {
+            const result = [];
+            for (let lineNumber = this.startLineNumber; lineNumber < this.endLineNumberExclusive; lineNumber++) {
+                result.push(f(lineNumber));
+            }
+            return result;
+        }
+        forEach(f) {
+            for (let lineNumber = this.startLineNumber; lineNumber < this.endLineNumberExclusive; lineNumber++) {
+                f(lineNumber);
+            }
+        }
+        /**
+         * @internal
+         */
+        serialize() {
+            return [this.startLineNumber, this.endLineNumberExclusive];
+        }
+        includes(lineNumber) {
+            return this.startLineNumber <= lineNumber && lineNumber < this.endLineNumberExclusive;
+        }
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    class LinesDiff {
+        constructor(changes, 
+        /**
+         * Sorted by original line ranges.
+         * The original line ranges and the modified line ranges must be disjoint (but can be touching).
+         */
+        moves, 
+        /**
+         * Indicates if the time out was reached.
+         * In that case, the diffs might be an approximation and the user should be asked to rerun the diff with more time.
+         */
+        hitTimeout) {
+            this.changes = changes;
+            this.moves = moves;
+            this.hitTimeout = hitTimeout;
+        }
+    }
+    /**
+     * Maps a line range in the original text model to a line range in the modified text model.
+     */
+    class LineRangeMapping {
+        static inverse(mapping, originalLineCount, modifiedLineCount) {
+            const result = [];
+            let lastOriginalEndLineNumber = 1;
+            let lastModifiedEndLineNumber = 1;
+            for (const m of mapping) {
+                const r = new LineRangeMapping(new LineRange(lastOriginalEndLineNumber, m.originalRange.startLineNumber), new LineRange(lastModifiedEndLineNumber, m.modifiedRange.startLineNumber), undefined);
+                if (!r.modifiedRange.isEmpty) {
+                    result.push(r);
+                }
+                lastOriginalEndLineNumber = m.originalRange.endLineNumberExclusive;
+                lastModifiedEndLineNumber = m.modifiedRange.endLineNumberExclusive;
+            }
+            const r = new LineRangeMapping(new LineRange(lastOriginalEndLineNumber, originalLineCount + 1), new LineRange(lastModifiedEndLineNumber, modifiedLineCount + 1), undefined);
+            if (!r.modifiedRange.isEmpty) {
+                result.push(r);
+            }
+            return result;
+        }
+        constructor(originalRange, modifiedRange, innerChanges) {
+            this.originalRange = originalRange;
+            this.modifiedRange = modifiedRange;
+            this.innerChanges = innerChanges;
+        }
+        toString() {
+            return `{${this.originalRange.toString()}->${this.modifiedRange.toString()}}`;
+        }
+        get changedLineCount() {
+            return Math.max(this.originalRange.length, this.modifiedRange.length);
+        }
+        flip() {
+            var _a;
+            return new LineRangeMapping(this.modifiedRange, this.originalRange, (_a = this.innerChanges) === null || _a === void 0 ? void 0 : _a.map(c => c.flip()));
+        }
+    }
+    /**
+     * Maps a range in the original text model to a range in the modified text model.
+     */
+    class RangeMapping {
+        constructor(originalRange, modifiedRange) {
+            this.originalRange = originalRange;
+            this.modifiedRange = modifiedRange;
+        }
+        toString() {
+            return `{${this.originalRange.toString()}->${this.modifiedRange.toString()}}`;
+        }
+        flip() {
+            return new RangeMapping(this.modifiedRange, this.originalRange);
+        }
+    }
+    // TODO@hediet: Make LineRangeMapping extend from this!
+    class SimpleLineRangeMapping {
+        constructor(original, modified) {
+            this.original = original;
+            this.modified = modified;
+        }
+        toString() {
+            return `{${this.original.toString()}->${this.modified.toString()}}`;
+        }
+        flip() {
+            return new SimpleLineRangeMapping(this.modified, this.original);
+        }
+    }
+    class MovedText {
+        constructor(lineRangeMapping, changes) {
+            this.lineRangeMapping = lineRangeMapping;
+            this.changes = changes;
+        }
+        flip() {
+            return new MovedText(this.lineRangeMapping.flip(), this.changes.map(c => c.flip()));
+        }
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    const MINIMUM_MATCHING_CHARACTER_LENGTH = 3;
+    class SmartLinesDiffComputer {
+        computeDiff(originalLines, modifiedLines, options) {
+            var _a;
+            const diffComputer = new DiffComputer(originalLines, modifiedLines, {
+                maxComputationTime: options.maxComputationTimeMs,
+                shouldIgnoreTrimWhitespace: options.ignoreTrimWhitespace,
+                shouldComputeCharChanges: true,
+                shouldMakePrettyDiff: true,
+                shouldPostProcessCharChanges: true,
+            });
+            const result = diffComputer.computeDiff();
+            const changes = [];
+            let lastChange = null;
+            for (const c of result.changes) {
+                let originalRange;
+                if (c.originalEndLineNumber === 0) {
+                    // Insertion
+                    originalRange = new LineRange(c.originalStartLineNumber + 1, c.originalStartLineNumber + 1);
+                }
+                else {
+                    originalRange = new LineRange(c.originalStartLineNumber, c.originalEndLineNumber + 1);
+                }
+                let modifiedRange;
+                if (c.modifiedEndLineNumber === 0) {
+                    // Deletion
+                    modifiedRange = new LineRange(c.modifiedStartLineNumber + 1, c.modifiedStartLineNumber + 1);
+                }
+                else {
+                    modifiedRange = new LineRange(c.modifiedStartLineNumber, c.modifiedEndLineNumber + 1);
+                }
+                let change = new LineRangeMapping(originalRange, modifiedRange, (_a = c.charChanges) === null || _a === void 0 ? void 0 : _a.map(c => new RangeMapping(new Range$1(c.originalStartLineNumber, c.originalStartColumn, c.originalEndLineNumber, c.originalEndColumn), new Range$1(c.modifiedStartLineNumber, c.modifiedStartColumn, c.modifiedEndLineNumber, c.modifiedEndColumn))));
+                if (lastChange) {
+                    if (lastChange.modifiedRange.endLineNumberExclusive === change.modifiedRange.startLineNumber
+                        || lastChange.originalRange.endLineNumberExclusive === change.originalRange.startLineNumber) {
+                        // join touching diffs. Probably moving diffs up/down in the algorithm causes touching diffs.
+                        change = new LineRangeMapping(lastChange.originalRange.join(change.originalRange), lastChange.modifiedRange.join(change.modifiedRange), lastChange.innerChanges && change.innerChanges ?
+                            lastChange.innerChanges.concat(change.innerChanges) : undefined);
+                        changes.pop();
+                    }
+                }
+                changes.push(change);
+                lastChange = change;
+            }
+            assertFn(() => {
+                return checkAdjacentItems(changes, (m1, m2) => m2.originalRange.startLineNumber - m1.originalRange.endLineNumberExclusive === m2.modifiedRange.startLineNumber - m1.modifiedRange.endLineNumberExclusive &&
+                    // There has to be an unchanged line in between (otherwise both diffs should have been joined)
+                    m1.originalRange.endLineNumberExclusive < m2.originalRange.startLineNumber &&
+                    m1.modifiedRange.endLineNumberExclusive < m2.modifiedRange.startLineNumber);
+            });
+            return new LinesDiff(changes, [], result.quitEarly);
+        }
+    }
+    function computeDiff(originalSequence, modifiedSequence, continueProcessingPredicate, pretty) {
+        const diffAlgo = new LcsDiff(originalSequence, modifiedSequence, continueProcessingPredicate);
+        return diffAlgo.ComputeDiff(pretty);
+    }
+    class LineSequence$1 {
+        constructor(lines) {
+            const startColumns = [];
+            const endColumns = [];
+            for (let i = 0, length = lines.length; i < length; i++) {
+                startColumns[i] = getFirstNonBlankColumn(lines[i], 1);
+                endColumns[i] = getLastNonBlankColumn(lines[i], 1);
+            }
+            this.lines = lines;
+            this._startColumns = startColumns;
+            this._endColumns = endColumns;
+        }
+        getElements() {
+            const elements = [];
+            for (let i = 0, len = this.lines.length; i < len; i++) {
+                elements[i] = this.lines[i].substring(this._startColumns[i] - 1, this._endColumns[i] - 1);
+            }
+            return elements;
+        }
+        getStrictElement(index) {
+            return this.lines[index];
+        }
+        getStartLineNumber(i) {
+            return i + 1;
+        }
+        getEndLineNumber(i) {
+            return i + 1;
+        }
+        createCharSequence(shouldIgnoreTrimWhitespace, startIndex, endIndex) {
+            const charCodes = [];
+            const lineNumbers = [];
+            const columns = [];
+            let len = 0;
+            for (let index = startIndex; index <= endIndex; index++) {
+                const lineContent = this.lines[index];
+                const startColumn = (shouldIgnoreTrimWhitespace ? this._startColumns[index] : 1);
+                const endColumn = (shouldIgnoreTrimWhitespace ? this._endColumns[index] : lineContent.length + 1);
+                for (let col = startColumn; col < endColumn; col++) {
+                    charCodes[len] = lineContent.charCodeAt(col - 1);
+                    lineNumbers[len] = index + 1;
+                    columns[len] = col;
+                    len++;
+                }
+                if (!shouldIgnoreTrimWhitespace && index < endIndex) {
+                    // Add \n if trim whitespace is not ignored
+                    charCodes[len] = 10 /* CharCode.LineFeed */;
+                    lineNumbers[len] = index + 1;
+                    columns[len] = lineContent.length + 1;
+                    len++;
+                }
+            }
+            return new CharSequence(charCodes, lineNumbers, columns);
+        }
+    }
+    class CharSequence {
+        constructor(charCodes, lineNumbers, columns) {
+            this._charCodes = charCodes;
+            this._lineNumbers = lineNumbers;
+            this._columns = columns;
+        }
+        toString() {
+            return ('[' + this._charCodes.map((s, idx) => (s === 10 /* CharCode.LineFeed */ ? '\\n' : String.fromCharCode(s)) + `-(${this._lineNumbers[idx]},${this._columns[idx]})`).join(', ') + ']');
+        }
+        _assertIndex(index, arr) {
+            if (index < 0 || index >= arr.length) {
+                throw new Error(`Illegal index`);
+            }
+        }
+        getElements() {
+            return this._charCodes;
+        }
+        getStartLineNumber(i) {
+            if (i > 0 && i === this._lineNumbers.length) {
+                // the start line number of the element after the last element
+                // is the end line number of the last element
+                return this.getEndLineNumber(i - 1);
+            }
+            this._assertIndex(i, this._lineNumbers);
+            return this._lineNumbers[i];
+        }
+        getEndLineNumber(i) {
+            if (i === -1) {
+                // the end line number of the element before the first element
+                // is the start line number of the first element
+                return this.getStartLineNumber(i + 1);
+            }
+            this._assertIndex(i, this._lineNumbers);
+            if (this._charCodes[i] === 10 /* CharCode.LineFeed */) {
+                return this._lineNumbers[i] + 1;
+            }
+            return this._lineNumbers[i];
+        }
+        getStartColumn(i) {
+            if (i > 0 && i === this._columns.length) {
+                // the start column of the element after the last element
+                // is the end column of the last element
+                return this.getEndColumn(i - 1);
+            }
+            this._assertIndex(i, this._columns);
+            return this._columns[i];
+        }
+        getEndColumn(i) {
+            if (i === -1) {
+                // the end column of the element before the first element
+                // is the start column of the first element
+                return this.getStartColumn(i + 1);
+            }
+            this._assertIndex(i, this._columns);
+            if (this._charCodes[i] === 10 /* CharCode.LineFeed */) {
+                return 1;
+            }
+            return this._columns[i] + 1;
+        }
+    }
+    class CharChange {
+        constructor(originalStartLineNumber, originalStartColumn, originalEndLineNumber, originalEndColumn, modifiedStartLineNumber, modifiedStartColumn, modifiedEndLineNumber, modifiedEndColumn) {
+            this.originalStartLineNumber = originalStartLineNumber;
+            this.originalStartColumn = originalStartColumn;
+            this.originalEndLineNumber = originalEndLineNumber;
+            this.originalEndColumn = originalEndColumn;
+            this.modifiedStartLineNumber = modifiedStartLineNumber;
+            this.modifiedStartColumn = modifiedStartColumn;
+            this.modifiedEndLineNumber = modifiedEndLineNumber;
+            this.modifiedEndColumn = modifiedEndColumn;
+        }
+        static createFromDiffChange(diffChange, originalCharSequence, modifiedCharSequence) {
+            const originalStartLineNumber = originalCharSequence.getStartLineNumber(diffChange.originalStart);
+            const originalStartColumn = originalCharSequence.getStartColumn(diffChange.originalStart);
+            const originalEndLineNumber = originalCharSequence.getEndLineNumber(diffChange.originalStart + diffChange.originalLength - 1);
+            const originalEndColumn = originalCharSequence.getEndColumn(diffChange.originalStart + diffChange.originalLength - 1);
+            const modifiedStartLineNumber = modifiedCharSequence.getStartLineNumber(diffChange.modifiedStart);
+            const modifiedStartColumn = modifiedCharSequence.getStartColumn(diffChange.modifiedStart);
+            const modifiedEndLineNumber = modifiedCharSequence.getEndLineNumber(diffChange.modifiedStart + diffChange.modifiedLength - 1);
+            const modifiedEndColumn = modifiedCharSequence.getEndColumn(diffChange.modifiedStart + diffChange.modifiedLength - 1);
+            return new CharChange(originalStartLineNumber, originalStartColumn, originalEndLineNumber, originalEndColumn, modifiedStartLineNumber, modifiedStartColumn, modifiedEndLineNumber, modifiedEndColumn);
+        }
+    }
+    function postProcessCharChanges(rawChanges) {
+        if (rawChanges.length <= 1) {
+            return rawChanges;
+        }
+        const result = [rawChanges[0]];
+        let prevChange = result[0];
+        for (let i = 1, len = rawChanges.length; i < len; i++) {
+            const currChange = rawChanges[i];
+            const originalMatchingLength = currChange.originalStart - (prevChange.originalStart + prevChange.originalLength);
+            const modifiedMatchingLength = currChange.modifiedStart - (prevChange.modifiedStart + prevChange.modifiedLength);
+            // Both of the above should be equal, but the continueProcessingPredicate may prevent this from being true
+            const matchingLength = Math.min(originalMatchingLength, modifiedMatchingLength);
+            if (matchingLength < MINIMUM_MATCHING_CHARACTER_LENGTH) {
+                // Merge the current change into the previous one
+                prevChange.originalLength = (currChange.originalStart + currChange.originalLength) - prevChange.originalStart;
+                prevChange.modifiedLength = (currChange.modifiedStart + currChange.modifiedLength) - prevChange.modifiedStart;
+            }
+            else {
+                // Add the current change
+                result.push(currChange);
+                prevChange = currChange;
+            }
+        }
+        return result;
+    }
+    class LineChange {
+        constructor(originalStartLineNumber, originalEndLineNumber, modifiedStartLineNumber, modifiedEndLineNumber, charChanges) {
+            this.originalStartLineNumber = originalStartLineNumber;
+            this.originalEndLineNumber = originalEndLineNumber;
+            this.modifiedStartLineNumber = modifiedStartLineNumber;
+            this.modifiedEndLineNumber = modifiedEndLineNumber;
+            this.charChanges = charChanges;
+        }
+        static createFromDiffResult(shouldIgnoreTrimWhitespace, diffChange, originalLineSequence, modifiedLineSequence, continueCharDiff, shouldComputeCharChanges, shouldPostProcessCharChanges) {
+            let originalStartLineNumber;
+            let originalEndLineNumber;
+            let modifiedStartLineNumber;
+            let modifiedEndLineNumber;
+            let charChanges = undefined;
+            if (diffChange.originalLength === 0) {
+                originalStartLineNumber = originalLineSequence.getStartLineNumber(diffChange.originalStart) - 1;
+                originalEndLineNumber = 0;
+            }
+            else {
+                originalStartLineNumber = originalLineSequence.getStartLineNumber(diffChange.originalStart);
+                originalEndLineNumber = originalLineSequence.getEndLineNumber(diffChange.originalStart + diffChange.originalLength - 1);
+            }
+            if (diffChange.modifiedLength === 0) {
+                modifiedStartLineNumber = modifiedLineSequence.getStartLineNumber(diffChange.modifiedStart) - 1;
+                modifiedEndLineNumber = 0;
+            }
+            else {
+                modifiedStartLineNumber = modifiedLineSequence.getStartLineNumber(diffChange.modifiedStart);
+                modifiedEndLineNumber = modifiedLineSequence.getEndLineNumber(diffChange.modifiedStart + diffChange.modifiedLength - 1);
+            }
+            if (shouldComputeCharChanges && diffChange.originalLength > 0 && diffChange.originalLength < 20 && diffChange.modifiedLength > 0 && diffChange.modifiedLength < 20 && continueCharDiff()) {
+                // Compute character changes for diff chunks of at most 20 lines...
+                const originalCharSequence = originalLineSequence.createCharSequence(shouldIgnoreTrimWhitespace, diffChange.originalStart, diffChange.originalStart + diffChange.originalLength - 1);
+                const modifiedCharSequence = modifiedLineSequence.createCharSequence(shouldIgnoreTrimWhitespace, diffChange.modifiedStart, diffChange.modifiedStart + diffChange.modifiedLength - 1);
+                if (originalCharSequence.getElements().length > 0 && modifiedCharSequence.getElements().length > 0) {
+                    let rawChanges = computeDiff(originalCharSequence, modifiedCharSequence, continueCharDiff, true).changes;
+                    if (shouldPostProcessCharChanges) {
+                        rawChanges = postProcessCharChanges(rawChanges);
+                    }
+                    charChanges = [];
+                    for (let i = 0, length = rawChanges.length; i < length; i++) {
+                        charChanges.push(CharChange.createFromDiffChange(rawChanges[i], originalCharSequence, modifiedCharSequence));
+                    }
+                }
+            }
+            return new LineChange(originalStartLineNumber, originalEndLineNumber, modifiedStartLineNumber, modifiedEndLineNumber, charChanges);
+        }
+    }
+    class DiffComputer {
+        constructor(originalLines, modifiedLines, opts) {
+            this.shouldComputeCharChanges = opts.shouldComputeCharChanges;
+            this.shouldPostProcessCharChanges = opts.shouldPostProcessCharChanges;
+            this.shouldIgnoreTrimWhitespace = opts.shouldIgnoreTrimWhitespace;
+            this.shouldMakePrettyDiff = opts.shouldMakePrettyDiff;
+            this.originalLines = originalLines;
+            this.modifiedLines = modifiedLines;
+            this.original = new LineSequence$1(originalLines);
+            this.modified = new LineSequence$1(modifiedLines);
+            this.continueLineDiff = createContinueProcessingPredicate(opts.maxComputationTime);
+            this.continueCharDiff = createContinueProcessingPredicate(opts.maxComputationTime === 0 ? 0 : Math.min(opts.maxComputationTime, 5000)); // never run after 5s for character changes...
+        }
+        computeDiff() {
+            if (this.original.lines.length === 1 && this.original.lines[0].length === 0) {
+                // empty original => fast path
+                if (this.modified.lines.length === 1 && this.modified.lines[0].length === 0) {
+                    return {
+                        quitEarly: false,
+                        changes: []
+                    };
+                }
+                return {
+                    quitEarly: false,
+                    changes: [{
+                            originalStartLineNumber: 1,
+                            originalEndLineNumber: 1,
+                            modifiedStartLineNumber: 1,
+                            modifiedEndLineNumber: this.modified.lines.length,
+                            charChanges: undefined
+                        }]
+                };
+            }
+            if (this.modified.lines.length === 1 && this.modified.lines[0].length === 0) {
+                // empty modified => fast path
+                return {
+                    quitEarly: false,
+                    changes: [{
+                            originalStartLineNumber: 1,
+                            originalEndLineNumber: this.original.lines.length,
+                            modifiedStartLineNumber: 1,
+                            modifiedEndLineNumber: 1,
+                            charChanges: undefined
+                        }]
+                };
+            }
+            const diffResult = computeDiff(this.original, this.modified, this.continueLineDiff, this.shouldMakePrettyDiff);
+            const rawChanges = diffResult.changes;
+            const quitEarly = diffResult.quitEarly;
+            // The diff is always computed with ignoring trim whitespace
+            // This ensures we get the prettiest diff
+            if (this.shouldIgnoreTrimWhitespace) {
+                const lineChanges = [];
+                for (let i = 0, length = rawChanges.length; i < length; i++) {
+                    lineChanges.push(LineChange.createFromDiffResult(this.shouldIgnoreTrimWhitespace, rawChanges[i], this.original, this.modified, this.continueCharDiff, this.shouldComputeCharChanges, this.shouldPostProcessCharChanges));
+                }
+                return {
+                    quitEarly: quitEarly,
+                    changes: lineChanges
+                };
+            }
+            // Need to post-process and introduce changes where the trim whitespace is different
+            // Note that we are looping starting at -1 to also cover the lines before the first change
+            const result = [];
+            let originalLineIndex = 0;
+            let modifiedLineIndex = 0;
+            for (let i = -1 /* !!!! */, len = rawChanges.length; i < len; i++) {
+                const nextChange = (i + 1 < len ? rawChanges[i + 1] : null);
+                const originalStop = (nextChange ? nextChange.originalStart : this.originalLines.length);
+                const modifiedStop = (nextChange ? nextChange.modifiedStart : this.modifiedLines.length);
+                while (originalLineIndex < originalStop && modifiedLineIndex < modifiedStop) {
+                    const originalLine = this.originalLines[originalLineIndex];
+                    const modifiedLine = this.modifiedLines[modifiedLineIndex];
+                    if (originalLine !== modifiedLine) {
+                        // These lines differ only in trim whitespace
+                        // Check the leading whitespace
+                        {
+                            let originalStartColumn = getFirstNonBlankColumn(originalLine, 1);
+                            let modifiedStartColumn = getFirstNonBlankColumn(modifiedLine, 1);
+                            while (originalStartColumn > 1 && modifiedStartColumn > 1) {
+                                const originalChar = originalLine.charCodeAt(originalStartColumn - 2);
+                                const modifiedChar = modifiedLine.charCodeAt(modifiedStartColumn - 2);
+                                if (originalChar !== modifiedChar) {
+                                    break;
+                                }
+                                originalStartColumn--;
+                                modifiedStartColumn--;
+                            }
+                            if (originalStartColumn > 1 || modifiedStartColumn > 1) {
+                                this._pushTrimWhitespaceCharChange(result, originalLineIndex + 1, 1, originalStartColumn, modifiedLineIndex + 1, 1, modifiedStartColumn);
+                            }
+                        }
+                        // Check the trailing whitespace
+                        {
+                            let originalEndColumn = getLastNonBlankColumn(originalLine, 1);
+                            let modifiedEndColumn = getLastNonBlankColumn(modifiedLine, 1);
+                            const originalMaxColumn = originalLine.length + 1;
+                            const modifiedMaxColumn = modifiedLine.length + 1;
+                            while (originalEndColumn < originalMaxColumn && modifiedEndColumn < modifiedMaxColumn) {
+                                const originalChar = originalLine.charCodeAt(originalEndColumn - 1);
+                                const modifiedChar = originalLine.charCodeAt(modifiedEndColumn - 1);
+                                if (originalChar !== modifiedChar) {
+                                    break;
+                                }
+                                originalEndColumn++;
+                                modifiedEndColumn++;
+                            }
+                            if (originalEndColumn < originalMaxColumn || modifiedEndColumn < modifiedMaxColumn) {
+                                this._pushTrimWhitespaceCharChange(result, originalLineIndex + 1, originalEndColumn, originalMaxColumn, modifiedLineIndex + 1, modifiedEndColumn, modifiedMaxColumn);
+                            }
+                        }
+                    }
+                    originalLineIndex++;
+                    modifiedLineIndex++;
+                }
+                if (nextChange) {
+                    // Emit the actual change
+                    result.push(LineChange.createFromDiffResult(this.shouldIgnoreTrimWhitespace, nextChange, this.original, this.modified, this.continueCharDiff, this.shouldComputeCharChanges, this.shouldPostProcessCharChanges));
+                    originalLineIndex += nextChange.originalLength;
+                    modifiedLineIndex += nextChange.modifiedLength;
+                }
+            }
+            return {
+                quitEarly: quitEarly,
+                changes: result
+            };
+        }
+        _pushTrimWhitespaceCharChange(result, originalLineNumber, originalStartColumn, originalEndColumn, modifiedLineNumber, modifiedStartColumn, modifiedEndColumn) {
+            if (this._mergeTrimWhitespaceCharChange(result, originalLineNumber, originalStartColumn, originalEndColumn, modifiedLineNumber, modifiedStartColumn, modifiedEndColumn)) {
+                // Merged into previous
+                return;
+            }
+            let charChanges = undefined;
+            if (this.shouldComputeCharChanges) {
+                charChanges = [new CharChange(originalLineNumber, originalStartColumn, originalLineNumber, originalEndColumn, modifiedLineNumber, modifiedStartColumn, modifiedLineNumber, modifiedEndColumn)];
+            }
+            result.push(new LineChange(originalLineNumber, originalLineNumber, modifiedLineNumber, modifiedLineNumber, charChanges));
+        }
+        _mergeTrimWhitespaceCharChange(result, originalLineNumber, originalStartColumn, originalEndColumn, modifiedLineNumber, modifiedStartColumn, modifiedEndColumn) {
+            const len = result.length;
+            if (len === 0) {
+                return false;
+            }
+            const prevChange = result[len - 1];
+            if (prevChange.originalEndLineNumber === 0 || prevChange.modifiedEndLineNumber === 0) {
+                // Don't merge with inserts/deletes
+                return false;
+            }
+            if (prevChange.originalEndLineNumber === originalLineNumber && prevChange.modifiedEndLineNumber === modifiedLineNumber) {
+                if (this.shouldComputeCharChanges && prevChange.charChanges) {
+                    prevChange.charChanges.push(new CharChange(originalLineNumber, originalStartColumn, originalLineNumber, originalEndColumn, modifiedLineNumber, modifiedStartColumn, modifiedLineNumber, modifiedEndColumn));
+                }
+                return true;
+            }
+            if (prevChange.originalEndLineNumber + 1 === originalLineNumber && prevChange.modifiedEndLineNumber + 1 === modifiedLineNumber) {
+                prevChange.originalEndLineNumber = originalLineNumber;
+                prevChange.modifiedEndLineNumber = modifiedLineNumber;
+                if (this.shouldComputeCharChanges && prevChange.charChanges) {
+                    prevChange.charChanges.push(new CharChange(originalLineNumber, originalStartColumn, originalLineNumber, originalEndColumn, modifiedLineNumber, modifiedStartColumn, modifiedLineNumber, modifiedEndColumn));
+                }
+                return true;
+            }
+            return false;
+        }
+    }
+    function getFirstNonBlankColumn(txt, defaultValue) {
+        const r = firstNonWhitespaceIndex(txt);
+        if (r === -1) {
+            return defaultValue;
+        }
+        return r + 1;
+    }
+    function getLastNonBlankColumn(txt, defaultValue) {
+        const r = lastNonWhitespaceIndex(txt);
+        if (r === -1) {
+            return defaultValue;
+        }
+        return r + 2;
+    }
+    function createContinueProcessingPredicate(maximumRuntime) {
+        if (maximumRuntime === 0) {
+            return () => true;
+        }
+        const startTime = Date.now();
+        return () => {
+            return Date.now() - startTime < maximumRuntime;
+        };
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    /**
+     * A range of offsets (0-based).
+    */
+    class OffsetRange {
+        static addRange(range, sortedRanges) {
+            let i = 0;
+            while (i < sortedRanges.length && sortedRanges[i].endExclusive < range.start) {
+                i++;
+            }
+            let j = i;
+            while (j < sortedRanges.length && sortedRanges[j].start <= range.endExclusive) {
+                j++;
+            }
+            if (i === j) {
+                sortedRanges.splice(i, 0, range);
+            }
+            else {
+                const start = Math.min(range.start, sortedRanges[i].start);
+                const end = Math.max(range.endExclusive, sortedRanges[j - 1].endExclusive);
+                sortedRanges.splice(i, j - i, new OffsetRange(start, end));
+            }
+        }
+        static tryCreate(start, endExclusive) {
+            if (start > endExclusive) {
+                return undefined;
+            }
+            return new OffsetRange(start, endExclusive);
+        }
+        constructor(start, endExclusive) {
+            this.start = start;
+            this.endExclusive = endExclusive;
+            if (start > endExclusive) {
+                throw new BugIndicatingError(`Invalid range: ${this.toString()}`);
+            }
+        }
+        get isEmpty() {
+            return this.start === this.endExclusive;
+        }
+        delta(offset) {
+            return new OffsetRange(this.start + offset, this.endExclusive + offset);
+        }
+        get length() {
+            return this.endExclusive - this.start;
+        }
+        toString() {
+            return `[${this.start}, ${this.endExclusive})`;
+        }
+        equals(other) {
+            return this.start === other.start && this.endExclusive === other.endExclusive;
+        }
+        containsRange(other) {
+            return this.start <= other.start && other.endExclusive <= this.endExclusive;
+        }
+        contains(offset) {
+            return this.start <= offset && offset < this.endExclusive;
+        }
+        /**
+         * for all numbers n: range1.contains(n) or range2.contains(n) => range1.join(range2).contains(n)
+         * The joined range is the smallest range that contains both ranges.
+         */
+        join(other) {
+            return new OffsetRange(Math.min(this.start, other.start), Math.max(this.endExclusive, other.endExclusive));
+        }
+        /**
+         * for all numbers n: range1.contains(n) and range2.contains(n) <=> range1.intersect(range2).contains(n)
+         *
+         * The resulting range is empty if the ranges do not intersect, but touch.
+         * If the ranges don't even touch, the result is undefined.
+         */
+        intersect(other) {
+            const start = Math.max(this.start, other.start);
+            const end = Math.min(this.endExclusive, other.endExclusive);
+            if (start <= end) {
+                return new OffsetRange(start, end);
+            }
+            return undefined;
+        }
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    class DiffAlgorithmResult {
+        static trivial(seq1, seq2) {
+            return new DiffAlgorithmResult([new SequenceDiff(new OffsetRange(0, seq1.length), new OffsetRange(0, seq2.length))], false);
+        }
+        static trivialTimedOut(seq1, seq2) {
+            return new DiffAlgorithmResult([new SequenceDiff(new OffsetRange(0, seq1.length), new OffsetRange(0, seq2.length))], true);
+        }
+        constructor(diffs, 
+        /**
+         * Indicates if the time out was reached.
+         * In that case, the diffs might be an approximation and the user should be asked to rerun the diff with more time.
+         */
+        hitTimeout) {
+            this.diffs = diffs;
+            this.hitTimeout = hitTimeout;
+        }
+    }
+    class SequenceDiff {
+        constructor(seq1Range, seq2Range) {
+            this.seq1Range = seq1Range;
+            this.seq2Range = seq2Range;
+        }
+        reverse() {
+            return new SequenceDiff(this.seq2Range, this.seq1Range);
+        }
+        toString() {
+            return `${this.seq1Range} <-> ${this.seq2Range}`;
+        }
+        join(other) {
+            return new SequenceDiff(this.seq1Range.join(other.seq1Range), this.seq2Range.join(other.seq2Range));
+        }
+        delta(offset) {
+            if (offset === 0) {
+                return this;
+            }
+            return new SequenceDiff(this.seq1Range.delta(offset), this.seq2Range.delta(offset));
+        }
+    }
+    class InfiniteTimeout {
+        isValid() {
+            return true;
+        }
+    }
+    InfiniteTimeout.instance = new InfiniteTimeout();
+    class DateTimeout {
+        constructor(timeout) {
+            this.timeout = timeout;
+            this.startTime = Date.now();
+            this.valid = true;
+            if (timeout <= 0) {
+                throw new BugIndicatingError('timeout must be positive');
+            }
+        }
+        // Recommendation: Set a log-point `{this.disable()}` in the body
+        isValid() {
+            const valid = Date.now() - this.startTime < this.timeout;
+            if (!valid && this.valid) {
+                this.valid = false; // timeout reached
+                // eslint-disable-next-line no-debugger
+                debugger; // WARNING: Most likely debugging caused the timeout. Call `this.disable()` to continue without timing out.
+            }
+            return this.valid;
+        }
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    class Array2D {
+        constructor(width, height) {
+            this.width = width;
+            this.height = height;
+            this.array = [];
+            this.array = new Array(width * height);
+        }
+        get(x, y) {
+            return this.array[x + y * this.width];
+        }
+        set(x, y, value) {
+            this.array[x + y * this.width] = value;
+        }
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    /**
+     * A O(MN) diffing algorithm that supports a score function.
+     * The algorithm can be improved by processing the 2d array diagonally.
+    */
+    class DynamicProgrammingDiffing {
+        compute(sequence1, sequence2, timeout = InfiniteTimeout.instance, equalityScore) {
+            if (sequence1.length === 0 || sequence2.length === 0) {
+                return DiffAlgorithmResult.trivial(sequence1, sequence2);
+            }
+            /**
+             * lcsLengths.get(i, j): Length of the longest common subsequence of sequence1.substring(0, i + 1) and sequence2.substring(0, j + 1).
+             */
+            const lcsLengths = new Array2D(sequence1.length, sequence2.length);
+            const directions = new Array2D(sequence1.length, sequence2.length);
+            const lengths = new Array2D(sequence1.length, sequence2.length);
+            // ==== Initializing lcsLengths ====
+            for (let s1 = 0; s1 < sequence1.length; s1++) {
+                for (let s2 = 0; s2 < sequence2.length; s2++) {
+                    if (!timeout.isValid()) {
+                        return DiffAlgorithmResult.trivialTimedOut(sequence1, sequence2);
+                    }
+                    const horizontalLen = s1 === 0 ? 0 : lcsLengths.get(s1 - 1, s2);
+                    const verticalLen = s2 === 0 ? 0 : lcsLengths.get(s1, s2 - 1);
+                    let extendedSeqScore;
+                    if (sequence1.getElement(s1) === sequence2.getElement(s2)) {
+                        if (s1 === 0 || s2 === 0) {
+                            extendedSeqScore = 0;
+                        }
+                        else {
+                            extendedSeqScore = lcsLengths.get(s1 - 1, s2 - 1);
+                        }
+                        if (s1 > 0 && s2 > 0 && directions.get(s1 - 1, s2 - 1) === 3) {
+                            // Prefer consecutive diagonals
+                            extendedSeqScore += lengths.get(s1 - 1, s2 - 1);
+                        }
+                        extendedSeqScore += (equalityScore ? equalityScore(s1, s2) : 1);
+                    }
+                    else {
+                        extendedSeqScore = -1;
+                    }
+                    const newValue = Math.max(horizontalLen, verticalLen, extendedSeqScore);
+                    if (newValue === extendedSeqScore) {
+                        // Prefer diagonals
+                        const prevLen = s1 > 0 && s2 > 0 ? lengths.get(s1 - 1, s2 - 1) : 0;
+                        lengths.set(s1, s2, prevLen + 1);
+                        directions.set(s1, s2, 3);
+                    }
+                    else if (newValue === horizontalLen) {
+                        lengths.set(s1, s2, 0);
+                        directions.set(s1, s2, 1);
+                    }
+                    else if (newValue === verticalLen) {
+                        lengths.set(s1, s2, 0);
+                        directions.set(s1, s2, 2);
+                    }
+                    lcsLengths.set(s1, s2, newValue);
+                }
+            }
+            // ==== Backtracking ====
+            const result = [];
+            let lastAligningPosS1 = sequence1.length;
+            let lastAligningPosS2 = sequence2.length;
+            function reportDecreasingAligningPositions(s1, s2) {
+                if (s1 + 1 !== lastAligningPosS1 || s2 + 1 !== lastAligningPosS2) {
+                    result.push(new SequenceDiff(new OffsetRange(s1 + 1, lastAligningPosS1), new OffsetRange(s2 + 1, lastAligningPosS2)));
+                }
+                lastAligningPosS1 = s1;
+                lastAligningPosS2 = s2;
+            }
+            let s1 = sequence1.length - 1;
+            let s2 = sequence2.length - 1;
+            while (s1 >= 0 && s2 >= 0) {
+                if (directions.get(s1, s2) === 3) {
+                    reportDecreasingAligningPositions(s1, s2);
+                    s1--;
+                    s2--;
+                }
+                else {
+                    if (directions.get(s1, s2) === 1) {
+                        s1--;
+                    }
+                    else {
+                        s2--;
+                    }
+                }
+            }
+            reportDecreasingAligningPositions(-1, -1);
+            result.reverse();
+            return new DiffAlgorithmResult(result, false);
+        }
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    function optimizeSequenceDiffs(sequence1, sequence2, sequenceDiffs) {
+        let result = sequenceDiffs;
+        result = joinSequenceDiffs(sequence1, sequence2, result);
+        result = shiftSequenceDiffs(sequence1, sequence2, result);
+        return result;
+    }
+    function smoothenSequenceDiffs(sequence1, sequence2, sequenceDiffs) {
+        const result = [];
+        for (const s of sequenceDiffs) {
+            const last = result[result.length - 1];
+            if (!last) {
+                result.push(s);
+                continue;
+            }
+            if (s.seq1Range.start - last.seq1Range.endExclusive <= 2 || s.seq2Range.start - last.seq2Range.endExclusive <= 2) {
+                result[result.length - 1] = new SequenceDiff(last.seq1Range.join(s.seq1Range), last.seq2Range.join(s.seq2Range));
+            }
+            else {
+                result.push(s);
+            }
+        }
+        return result;
+    }
+    function removeRandomMatches(sequence1, sequence2, sequenceDiffs) {
+        let diffs = sequenceDiffs;
+        if (diffs.length === 0) {
+            return diffs;
+        }
+        let counter = 0;
+        let shouldRepeat;
+        do {
+            shouldRepeat = false;
+            const result = [
+                diffs[0]
+            ];
+            for (let i = 1; i < diffs.length; i++) {
+                const cur = diffs[i];
+                const lastResult = result[result.length - 1];
+                function shouldJoinDiffs(before, after) {
+                    const unchangedRange = new OffsetRange(lastResult.seq1Range.endExclusive, cur.seq1Range.start);
+                    const unchangedLineCount = sequence1.countLinesIn(unchangedRange);
+                    if (unchangedLineCount > 5 || unchangedRange.length > 500) {
+                        return false;
+                    }
+                    const unchangedText = sequence1.getText(unchangedRange).trim();
+                    if (unchangedText.length > 20 || unchangedText.split(/\r\n|\r|\n/).length > 1) {
+                        return false;
+                    }
+                    const beforeLineCount1 = sequence1.countLinesIn(before.seq1Range);
+                    const beforeSeq1Length = before.seq1Range.length;
+                    const beforeLineCount2 = sequence2.countLinesIn(before.seq2Range);
+                    const beforeSeq2Length = before.seq2Range.length;
+                    const afterLineCount1 = sequence1.countLinesIn(after.seq1Range);
+                    const afterSeq1Length = after.seq1Range.length;
+                    const afterLineCount2 = sequence2.countLinesIn(after.seq2Range);
+                    const afterSeq2Length = after.seq2Range.length;
+                    // TODO: Maybe a neural net can be used to derive the result from these numbers
+                    const max = 2 * 40 + 50;
+                    function cap(v) {
+                        return Math.min(v, max);
+                    }
+                    if (Math.pow(Math.pow(cap(beforeLineCount1 * 40 + beforeSeq1Length), 1.5) + Math.pow(cap(beforeLineCount2 * 40 + beforeSeq2Length), 1.5), 1.5)
+                        + Math.pow(Math.pow(cap(afterLineCount1 * 40 + afterSeq1Length), 1.5) + Math.pow(cap(afterLineCount2 * 40 + afterSeq2Length), 1.5), 1.5) > (Math.pow((Math.pow(max, 1.5)), 1.5)) * 1.3) {
+                        return true;
+                    }
+                    return false;
+                }
+                const shouldJoin = shouldJoinDiffs(lastResult, cur);
+                if (shouldJoin) {
+                    shouldRepeat = true;
+                    result[result.length - 1] = result[result.length - 1].join(cur);
+                }
+                else {
+                    result.push(cur);
+                }
+            }
+            diffs = result;
+        } while (counter++ < 10 && shouldRepeat);
+        return diffs;
+    }
+    /**
+     * This function fixes issues like this:
+     * ```
+     * import { Baz, Bar } from "foo";
+     * ```
+     * <->
+     * ```
+     * import { Baz, Bar, Foo } from "foo";
+     * ```
+     * Computed diff: [ {Add "," after Bar}, {Add "Foo " after space} }
+     * Improved diff: [{Add ", Foo" after Bar}]
+     */
+    function joinSequenceDiffs(sequence1, sequence2, sequenceDiffs) {
+        if (sequenceDiffs.length === 0) {
+            return sequenceDiffs;
+        }
+        const result = [];
+        result.push(sequenceDiffs[0]);
+        // First move them all to the left as much as possible and join them if possible
+        for (let i = 1; i < sequenceDiffs.length; i++) {
+            const prevResult = result[result.length - 1];
+            let cur = sequenceDiffs[i];
+            if (cur.seq1Range.isEmpty || cur.seq2Range.isEmpty) {
+                const length = cur.seq1Range.start - prevResult.seq1Range.endExclusive;
+                let d;
+                for (d = 1; d <= length; d++) {
+                    if (sequence1.getElement(cur.seq1Range.start - d) !== sequence1.getElement(cur.seq1Range.endExclusive - d) ||
+                        sequence2.getElement(cur.seq2Range.start - d) !== sequence2.getElement(cur.seq2Range.endExclusive - d)) {
+                        break;
+                    }
+                }
+                d--;
+                if (d === length) {
+                    // Merge previous and current diff
+                    result[result.length - 1] = new SequenceDiff(new OffsetRange(prevResult.seq1Range.start, cur.seq1Range.endExclusive - length), new OffsetRange(prevResult.seq2Range.start, cur.seq2Range.endExclusive - length));
+                    continue;
+                }
+                cur = cur.delta(-d);
+            }
+            result.push(cur);
+        }
+        const result2 = [];
+        // Then move them all to the right and join them again if possible
+        for (let i = 0; i < result.length - 1; i++) {
+            const nextResult = result[i + 1];
+            let cur = result[i];
+            if (cur.seq1Range.isEmpty || cur.seq2Range.isEmpty) {
+                const length = nextResult.seq1Range.start - cur.seq1Range.endExclusive;
+                let d;
+                for (d = 0; d < length; d++) {
+                    if (sequence1.getElement(cur.seq1Range.start + d) !== sequence1.getElement(cur.seq1Range.endExclusive + d) ||
+                        sequence2.getElement(cur.seq2Range.start + d) !== sequence2.getElement(cur.seq2Range.endExclusive + d)) {
+                        break;
+                    }
+                }
+                if (d === length) {
+                    // Merge previous and current diff, write to result!
+                    result[i + 1] = new SequenceDiff(new OffsetRange(cur.seq1Range.start + length, nextResult.seq1Range.endExclusive), new OffsetRange(cur.seq2Range.start + length, nextResult.seq2Range.endExclusive));
+                    continue;
+                }
+                if (d > 0) {
+                    cur = cur.delta(d);
+                }
+            }
+            result2.push(cur);
+        }
+        if (result.length > 0) {
+            result2.push(result[result.length - 1]);
+        }
+        return result2;
+    }
+    // align character level diffs at whitespace characters
+    // import { IBar } from "foo";
+    // import { I[Arr, I]Bar } from "foo";
+    // ->
+    // import { [IArr, ]IBar } from "foo";
+    // import { ITransaction, observableValue, transaction } from 'vs/base/common/observable';
+    // import { ITransaction, observable[FromEvent, observable]Value, transaction } from 'vs/base/common/observable';
+    // ->
+    // import { ITransaction, [observableFromEvent, ]observableValue, transaction } from 'vs/base/common/observable';
+    // collectBrackets(level + 1, levelPerBracketType);
+    // collectBrackets(level + 1, levelPerBracket[ + 1, levelPerBracket]Type);
+    // ->
+    // collectBrackets(level + 1, [levelPerBracket + 1, ]levelPerBracketType);
+    function shiftSequenceDiffs(sequence1, sequence2, sequenceDiffs) {
+        if (!sequence1.getBoundaryScore || !sequence2.getBoundaryScore) {
+            return sequenceDiffs;
+        }
+        for (let i = 0; i < sequenceDiffs.length; i++) {
+            const prevDiff = (i > 0 ? sequenceDiffs[i - 1] : undefined);
+            const diff = sequenceDiffs[i];
+            const nextDiff = (i + 1 < sequenceDiffs.length ? sequenceDiffs[i + 1] : undefined);
+            const seq1ValidRange = new OffsetRange(prevDiff ? prevDiff.seq1Range.start + 1 : 0, nextDiff ? nextDiff.seq1Range.endExclusive - 1 : sequence1.length);
+            const seq2ValidRange = new OffsetRange(prevDiff ? prevDiff.seq2Range.start + 1 : 0, nextDiff ? nextDiff.seq2Range.endExclusive - 1 : sequence2.length);
+            if (diff.seq1Range.isEmpty) {
+                sequenceDiffs[i] = shiftDiffToBetterPosition(diff, sequence1, sequence2, seq1ValidRange, seq2ValidRange);
+            }
+            else if (diff.seq2Range.isEmpty) {
+                sequenceDiffs[i] = shiftDiffToBetterPosition(diff.reverse(), sequence2, sequence1, seq2ValidRange, seq1ValidRange).reverse();
+            }
+        }
+        return sequenceDiffs;
+    }
+    function shiftDiffToBetterPosition(diff, sequence1, sequence2, seq1ValidRange, seq2ValidRange) {
+        const maxShiftLimit = 100; // To prevent performance issues
+        // don't touch previous or next!
+        let deltaBefore = 1;
+        while (diff.seq1Range.start - deltaBefore >= seq1ValidRange.start &&
+            diff.seq2Range.start - deltaBefore >= seq2ValidRange.start &&
+            sequence2.getElement(diff.seq2Range.start - deltaBefore) ===
+                sequence2.getElement(diff.seq2Range.endExclusive - deltaBefore) && deltaBefore < maxShiftLimit) {
+            deltaBefore++;
+        }
+        deltaBefore--;
+        let deltaAfter = 0;
+        while (diff.seq1Range.start + deltaAfter < seq1ValidRange.endExclusive &&
+            diff.seq2Range.endExclusive + deltaAfter < seq2ValidRange.endExclusive &&
+            sequence2.getElement(diff.seq2Range.start + deltaAfter) ===
+                sequence2.getElement(diff.seq2Range.endExclusive + deltaAfter) && deltaAfter < maxShiftLimit) {
+            deltaAfter++;
+        }
+        if (deltaBefore === 0 && deltaAfter === 0) {
+            return diff;
+        }
+        // Visualize `[sequence1.text, diff.seq1Range.start + deltaAfter]`
+        // and `[sequence2.text, diff.seq2Range.start + deltaAfter, diff.seq2Range.endExclusive + deltaAfter]`
+        let bestDelta = 0;
+        let bestScore = -1;
+        // find best scored delta
+        for (let delta = -deltaBefore; delta <= deltaAfter; delta++) {
+            const seq2OffsetStart = diff.seq2Range.start + delta;
+            const seq2OffsetEndExclusive = diff.seq2Range.endExclusive + delta;
+            const seq1Offset = diff.seq1Range.start + delta;
+            const score = sequence1.getBoundaryScore(seq1Offset) + sequence2.getBoundaryScore(seq2OffsetStart) + sequence2.getBoundaryScore(seq2OffsetEndExclusive);
+            if (score > bestScore) {
+                bestScore = score;
+                bestDelta = delta;
+            }
+        }
+        return diff.delta(bestDelta);
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    /**
+     * An O(ND) diff algorithm that has a quadratic space worst-case complexity.
+    */
+    class MyersDiffAlgorithm {
+        compute(seq1, seq2, timeout = InfiniteTimeout.instance) {
+            // These are common special cases.
+            // The early return improves performance dramatically.
+            if (seq1.length === 0 || seq2.length === 0) {
+                return DiffAlgorithmResult.trivial(seq1, seq2);
+            }
+            function getXAfterSnake(x, y) {
+                while (x < seq1.length && y < seq2.length && seq1.getElement(x) === seq2.getElement(y)) {
+                    x++;
+                    y++;
+                }
+                return x;
+            }
+            let d = 0;
+            // V[k]: X value of longest d-line that ends in diagonal k.
+            // d-line: path from (0,0) to (x,y) that uses exactly d non-diagonals.
+            // diagonal k: Set of points (x,y) with x-y = k.
+            const V = new FastInt32Array();
+            V.set(0, getXAfterSnake(0, 0));
+            const paths = new FastArrayNegativeIndices();
+            paths.set(0, V.get(0) === 0 ? null : new SnakePath(null, 0, 0, V.get(0)));
+            let k = 0;
+            loop: while (true) {
+                d++;
+                if (!timeout.isValid()) {
+                    return DiffAlgorithmResult.trivialTimedOut(seq1, seq2);
+                }
+                // The paper has `for (k = -d; k <= d; k += 2)`, but we can ignore diagonals that cannot influence the result.
+                const lowerBound = -Math.min(d, seq2.length + (d % 2));
+                const upperBound = Math.min(d, seq1.length + (d % 2));
+                for (k = lowerBound; k <= upperBound; k += 2) {
+                    // We can use the X values of (d-1)-lines to compute X value of the longest d-lines.
+                    const maxXofDLineTop = k === upperBound ? -1 : V.get(k + 1); // We take a vertical non-diagonal (add a symbol in seq1)
+                    const maxXofDLineLeft = k === lowerBound ? -1 : V.get(k - 1) + 1; // We take a horizontal non-diagonal (+1 x) (delete a symbol in seq1)
+                    const x = Math.min(Math.max(maxXofDLineTop, maxXofDLineLeft), seq1.length);
+                    const y = x - k;
+                    if (x > seq1.length || y > seq2.length) {
+                        // This diagonal is irrelevant for the result.
+                        // TODO: Don't pay the cost for this in the next iteration.
+                        continue;
+                    }
+                    const newMaxX = getXAfterSnake(x, y);
+                    V.set(k, newMaxX);
+                    const lastPath = x === maxXofDLineTop ? paths.get(k + 1) : paths.get(k - 1);
+                    paths.set(k, newMaxX !== x ? new SnakePath(lastPath, x, y, newMaxX - x) : lastPath);
+                    if (V.get(k) === seq1.length && V.get(k) - k === seq2.length) {
+                        break loop;
+                    }
+                }
+            }
+            let path = paths.get(k);
+            const result = [];
+            let lastAligningPosS1 = seq1.length;
+            let lastAligningPosS2 = seq2.length;
+            while (true) {
+                const endX = path ? path.x + path.length : 0;
+                const endY = path ? path.y + path.length : 0;
+                if (endX !== lastAligningPosS1 || endY !== lastAligningPosS2) {
+                    result.push(new SequenceDiff(new OffsetRange(endX, lastAligningPosS1), new OffsetRange(endY, lastAligningPosS2)));
+                }
+                if (!path) {
+                    break;
+                }
+                lastAligningPosS1 = path.x;
+                lastAligningPosS2 = path.y;
+                path = path.prev;
+            }
+            result.reverse();
+            return new DiffAlgorithmResult(result, false);
+        }
+    }
+    class SnakePath {
+        constructor(prev, x, y, length) {
+            this.prev = prev;
+            this.x = x;
+            this.y = y;
+            this.length = length;
+        }
+    }
+    /**
+     * An array that supports fast negative indices.
+    */
+    class FastInt32Array {
+        constructor() {
+            this.positiveArr = new Int32Array(10);
+            this.negativeArr = new Int32Array(10);
+        }
+        get(idx) {
+            if (idx < 0) {
+                idx = -idx - 1;
+                return this.negativeArr[idx];
+            }
+            else {
+                return this.positiveArr[idx];
+            }
+        }
+        set(idx, value) {
+            if (idx < 0) {
+                idx = -idx - 1;
+                if (idx >= this.negativeArr.length) {
+                    const arr = this.negativeArr;
+                    this.negativeArr = new Int32Array(arr.length * 2);
+                    this.negativeArr.set(arr);
+                }
+                this.negativeArr[idx] = value;
+            }
+            else {
+                if (idx >= this.positiveArr.length) {
+                    const arr = this.positiveArr;
+                    this.positiveArr = new Int32Array(arr.length * 2);
+                    this.positiveArr.set(arr);
+                }
+                this.positiveArr[idx] = value;
+            }
+        }
+    }
+    /**
+     * An array that supports fast negative indices.
+    */
+    class FastArrayNegativeIndices {
+        constructor() {
+            this.positiveArr = [];
+            this.negativeArr = [];
+        }
+        get(idx) {
+            if (idx < 0) {
+                idx = -idx - 1;
+                return this.negativeArr[idx];
+            }
+            else {
+                return this.positiveArr[idx];
+            }
+        }
+        set(idx, value) {
+            if (idx < 0) {
+                idx = -idx - 1;
+                this.negativeArr[idx] = value;
+            }
+            else {
+                this.positiveArr[idx] = value;
+            }
+        }
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    class StandardLinesDiffComputer {
+        constructor() {
+            this.dynamicProgrammingDiffing = new DynamicProgrammingDiffing();
+            this.myersDiffingAlgorithm = new MyersDiffAlgorithm();
+        }
+        computeDiff(originalLines, modifiedLines, options) {
+            if (originalLines.length === 1 && originalLines[0].length === 0 || modifiedLines.length === 1 && modifiedLines[0].length === 0) {
+                return {
+                    changes: [
+                        new LineRangeMapping(new LineRange(1, originalLines.length + 1), new LineRange(1, modifiedLines.length + 1), [
+                            new RangeMapping(new Range$1(1, 1, originalLines.length, originalLines[0].length + 1), new Range$1(1, 1, modifiedLines.length, modifiedLines[0].length + 1))
+                        ])
+                    ],
+                    hitTimeout: false,
+                    moves: [],
+                };
+            }
+            const timeout = options.maxComputationTimeMs === 0 ? InfiniteTimeout.instance : new DateTimeout(options.maxComputationTimeMs);
+            const considerWhitespaceChanges = !options.ignoreTrimWhitespace;
+            const perfectHashes = new Map();
+            function getOrCreateHash(text) {
+                let hash = perfectHashes.get(text);
+                if (hash === undefined) {
+                    hash = perfectHashes.size;
+                    perfectHashes.set(text, hash);
+                }
+                return hash;
+            }
+            const srcDocLines = originalLines.map((l) => getOrCreateHash(l.trim()));
+            const tgtDocLines = modifiedLines.map((l) => getOrCreateHash(l.trim()));
+            const sequence1 = new LineSequence(srcDocLines, originalLines);
+            const sequence2 = new LineSequence(tgtDocLines, modifiedLines);
+            const lineAlignmentResult = (() => {
+                if (sequence1.length + sequence2.length < 1500) {
+                    // Use the improved algorithm for small files
+                    return this.dynamicProgrammingDiffing.compute(sequence1, sequence2, timeout, (offset1, offset2) => originalLines[offset1] === modifiedLines[offset2]
+                        ? modifiedLines[offset2].length === 0
+                            ? 0.1
+                            : 1 + Math.log(1 + modifiedLines[offset2].length)
+                        : 0.99);
+                }
+                return this.myersDiffingAlgorithm.compute(sequence1, sequence2);
+            })();
+            let lineAlignments = lineAlignmentResult.diffs;
+            let hitTimeout = lineAlignmentResult.hitTimeout;
+            lineAlignments = optimizeSequenceDiffs(sequence1, sequence2, lineAlignments);
+            const alignments = [];
+            const scanForWhitespaceChanges = (equalLinesCount) => {
+                if (!considerWhitespaceChanges) {
+                    return;
+                }
+                for (let i = 0; i < equalLinesCount; i++) {
+                    const seq1Offset = seq1LastStart + i;
+                    const seq2Offset = seq2LastStart + i;
+                    if (originalLines[seq1Offset] !== modifiedLines[seq2Offset]) {
+                        // This is because of whitespace changes, diff these lines
+                        const characterDiffs = this.refineDiff(originalLines, modifiedLines, new SequenceDiff(new OffsetRange(seq1Offset, seq1Offset + 1), new OffsetRange(seq2Offset, seq2Offset + 1)), timeout, considerWhitespaceChanges);
+                        for (const a of characterDiffs.mappings) {
+                            alignments.push(a);
+                        }
+                        if (characterDiffs.hitTimeout) {
+                            hitTimeout = true;
+                        }
+                    }
+                }
+            };
+            let seq1LastStart = 0;
+            let seq2LastStart = 0;
+            for (const diff of lineAlignments) {
+                assertFn(() => diff.seq1Range.start - seq1LastStart === diff.seq2Range.start - seq2LastStart);
+                const equalLinesCount = diff.seq1Range.start - seq1LastStart;
+                scanForWhitespaceChanges(equalLinesCount);
+                seq1LastStart = diff.seq1Range.endExclusive;
+                seq2LastStart = diff.seq2Range.endExclusive;
+                const characterDiffs = this.refineDiff(originalLines, modifiedLines, diff, timeout, considerWhitespaceChanges);
+                if (characterDiffs.hitTimeout) {
+                    hitTimeout = true;
+                }
+                for (const a of characterDiffs.mappings) {
+                    alignments.push(a);
+                }
+            }
+            scanForWhitespaceChanges(originalLines.length - seq1LastStart);
+            const changes = lineRangeMappingFromRangeMappings(alignments, originalLines, modifiedLines);
+            const moves = [];
+            if (options.computeMoves) {
+                const deletions = changes
+                    .filter(c => c.modifiedRange.isEmpty && c.originalRange.length >= 3)
+                    .map(d => new LineRangeFragment(d.originalRange, originalLines));
+                const insertions = new Set(changes
+                    .filter(c => c.originalRange.isEmpty && c.modifiedRange.length >= 3)
+                    .map(d => new LineRangeFragment(d.modifiedRange, modifiedLines)));
+                for (const deletion of deletions) {
+                    let highestSimilarity = -1;
+                    let best;
+                    for (const insertion of insertions) {
+                        const similarity = deletion.computeSimilarity(insertion);
+                        if (similarity > highestSimilarity) {
+                            highestSimilarity = similarity;
+                            best = insertion;
+                        }
+                    }
+                    if (highestSimilarity > 0.90 && best) {
+                        const moveChanges = this.refineDiff(originalLines, modifiedLines, new SequenceDiff(new OffsetRange(deletion.range.startLineNumber - 1, deletion.range.endLineNumberExclusive - 1), new OffsetRange(best.range.startLineNumber - 1, best.range.endLineNumberExclusive - 1)), timeout, considerWhitespaceChanges);
+                        const mappings = lineRangeMappingFromRangeMappings(moveChanges.mappings, originalLines, modifiedLines, true);
+                        insertions.delete(best);
+                        moves.push(new MovedText(new SimpleLineRangeMapping(deletion.range, best.range), mappings));
+                    }
+                }
+            }
+            // Make sure all ranges are valid
+            assertFn(() => {
+                function validatePosition(pos, lines) {
+                    if (pos.lineNumber < 1 || pos.lineNumber > lines.length) {
+                        return false;
+                    }
+                    const line = lines[pos.lineNumber - 1];
+                    if (pos.column < 1 || pos.column > line.length + 1) {
+                        return false;
+                    }
+                    return true;
+                }
+                function validateRange(range, lines) {
+                    if (range.startLineNumber < 1 || range.startLineNumber > lines.length + 1) {
+                        return false;
+                    }
+                    if (range.endLineNumberExclusive < 1 || range.endLineNumberExclusive > lines.length + 1) {
+                        return false;
+                    }
+                    return true;
+                }
+                for (const c of changes) {
+                    if (!c.innerChanges) {
+                        return false;
+                    }
+                    for (const ic of c.innerChanges) {
+                        const valid = validatePosition(ic.modifiedRange.getStartPosition(), modifiedLines) && validatePosition(ic.modifiedRange.getEndPosition(), modifiedLines) &&
+                            validatePosition(ic.originalRange.getStartPosition(), originalLines) && validatePosition(ic.originalRange.getEndPosition(), originalLines);
+                        if (!valid) {
+                            return false;
+                        }
+                    }
+                    if (!validateRange(c.modifiedRange, modifiedLines) || !validateRange(c.originalRange, originalLines)) {
+                        return false;
+                    }
+                }
+                return true;
+            });
+            return new LinesDiff(changes, moves, hitTimeout);
+        }
+        refineDiff(originalLines, modifiedLines, diff, timeout, considerWhitespaceChanges) {
+            const slice1 = new LinesSliceCharSequence(originalLines, diff.seq1Range, considerWhitespaceChanges);
+            const slice2 = new LinesSliceCharSequence(modifiedLines, diff.seq2Range, considerWhitespaceChanges);
+            const diffResult = slice1.length + slice2.length < 500
+                ? this.dynamicProgrammingDiffing.compute(slice1, slice2, timeout)
+                : this.myersDiffingAlgorithm.compute(slice1, slice2, timeout);
+            let diffs = diffResult.diffs;
+            diffs = optimizeSequenceDiffs(slice1, slice2, diffs);
+            diffs = coverFullWords(slice1, slice2, diffs);
+            diffs = smoothenSequenceDiffs(slice1, slice2, diffs);
+            diffs = removeRandomMatches(slice1, slice2, diffs);
+            const result = diffs.map((d) => new RangeMapping(slice1.translateRange(d.seq1Range), slice2.translateRange(d.seq2Range)));
+            // Assert: result applied on original should be the same as diff applied to original
+            return {
+                mappings: result,
+                hitTimeout: diffResult.hitTimeout,
+            };
+        }
+    }
+    function coverFullWords(sequence1, sequence2, sequenceDiffs) {
+        const additional = [];
+        let lastModifiedWord = undefined;
+        function maybePushWordToAdditional() {
+            if (!lastModifiedWord) {
+                return;
+            }
+            const originalLength1 = lastModifiedWord.s1Range.length - lastModifiedWord.deleted;
+            lastModifiedWord.s2Range.length - lastModifiedWord.added;
+            if (Math.max(lastModifiedWord.deleted, lastModifiedWord.added) + (lastModifiedWord.count - 1) > originalLength1) {
+                additional.push(new SequenceDiff(lastModifiedWord.s1Range, lastModifiedWord.s2Range));
+            }
+            lastModifiedWord = undefined;
+        }
+        for (const s of sequenceDiffs) {
+            function processWord(s1Range, s2Range) {
+                var _a, _b, _c, _d;
+                if (!lastModifiedWord || !lastModifiedWord.s1Range.containsRange(s1Range) || !lastModifiedWord.s2Range.containsRange(s2Range)) {
+                    if (lastModifiedWord && !(lastModifiedWord.s1Range.endExclusive < s1Range.start && lastModifiedWord.s2Range.endExclusive < s2Range.start)) {
+                        const s1Added = OffsetRange.tryCreate(lastModifiedWord.s1Range.endExclusive, s1Range.start);
+                        const s2Added = OffsetRange.tryCreate(lastModifiedWord.s2Range.endExclusive, s2Range.start);
+                        lastModifiedWord.deleted += (_a = s1Added === null || s1Added === void 0 ? void 0 : s1Added.length) !== null && _a !== void 0 ? _a : 0;
+                        lastModifiedWord.added += (_b = s2Added === null || s2Added === void 0 ? void 0 : s2Added.length) !== null && _b !== void 0 ? _b : 0;
+                        lastModifiedWord.s1Range = lastModifiedWord.s1Range.join(s1Range);
+                        lastModifiedWord.s2Range = lastModifiedWord.s2Range.join(s2Range);
+                    }
+                    else {
+                        maybePushWordToAdditional();
+                        lastModifiedWord = { added: 0, deleted: 0, count: 0, s1Range: s1Range, s2Range: s2Range };
+                    }
+                }
+                const changedS1 = s1Range.intersect(s.seq1Range);
+                const changedS2 = s2Range.intersect(s.seq2Range);
+                lastModifiedWord.count++;
+                lastModifiedWord.deleted += (_c = changedS1 === null || changedS1 === void 0 ? void 0 : changedS1.length) !== null && _c !== void 0 ? _c : 0;
+                lastModifiedWord.added += (_d = changedS2 === null || changedS2 === void 0 ? void 0 : changedS2.length) !== null && _d !== void 0 ? _d : 0;
+            }
+            const w1Before = sequence1.findWordContaining(s.seq1Range.start - 1);
+            const w2Before = sequence2.findWordContaining(s.seq2Range.start - 1);
+            const w1After = sequence1.findWordContaining(s.seq1Range.endExclusive);
+            const w2After = sequence2.findWordContaining(s.seq2Range.endExclusive);
+            if (w1Before && w1After && w2Before && w2After && w1Before.equals(w1After) && w2Before.equals(w2After)) {
+                processWord(w1Before, w2Before);
+            }
+            else {
+                if (w1Before && w2Before) {
+                    processWord(w1Before, w2Before);
+                }
+                if (w1After && w2After) {
+                    processWord(w1After, w2After);
+                }
+            }
+        }
+        maybePushWordToAdditional();
+        const merged = mergeSequenceDiffs(sequenceDiffs, additional);
+        return merged;
+    }
+    function mergeSequenceDiffs(sequenceDiffs1, sequenceDiffs2) {
+        const result = [];
+        while (sequenceDiffs1.length > 0 || sequenceDiffs2.length > 0) {
+            const sd1 = sequenceDiffs1[0];
+            const sd2 = sequenceDiffs2[0];
+            let next;
+            if (sd1 && (!sd2 || sd1.seq1Range.start < sd2.seq1Range.start)) {
+                next = sequenceDiffs1.shift();
+            }
+            else {
+                next = sequenceDiffs2.shift();
+            }
+            if (result.length > 0 && result[result.length - 1].seq1Range.endExclusive >= next.seq1Range.start) {
+                result[result.length - 1] = result[result.length - 1].join(next);
+            }
+            else {
+                result.push(next);
+            }
+        }
+        return result;
+    }
+    function lineRangeMappingFromRangeMappings(alignments, originalLines, modifiedLines, dontAssertStartLine = false) {
+        const changes = [];
+        for (const g of group(alignments.map(a => getLineRangeMapping(a, originalLines, modifiedLines)), (a1, a2) => a1.originalRange.overlapOrTouch(a2.originalRange)
+            || a1.modifiedRange.overlapOrTouch(a2.modifiedRange))) {
+            const first = g[0];
+            const last = g[g.length - 1];
+            changes.push(new LineRangeMapping(first.originalRange.join(last.originalRange), first.modifiedRange.join(last.modifiedRange), g.map(a => a.innerChanges[0])));
+        }
+        assertFn(() => {
+            if (!dontAssertStartLine) {
+                if (changes.length > 0 && changes[0].originalRange.startLineNumber !== changes[0].modifiedRange.startLineNumber) {
+                    return false;
+                }
+            }
+            return checkAdjacentItems(changes, (m1, m2) => m2.originalRange.startLineNumber - m1.originalRange.endLineNumberExclusive === m2.modifiedRange.startLineNumber - m1.modifiedRange.endLineNumberExclusive &&
+                // There has to be an unchanged line in between (otherwise both diffs should have been joined)
+                m1.originalRange.endLineNumberExclusive < m2.originalRange.startLineNumber &&
+                m1.modifiedRange.endLineNumberExclusive < m2.modifiedRange.startLineNumber);
+        });
+        return changes;
+    }
+    function getLineRangeMapping(rangeMapping, originalLines, modifiedLines) {
+        let lineStartDelta = 0;
+        let lineEndDelta = 0;
+        // rangeMapping describes the edit that replaces `rangeMapping.originalRange` with `newText := getText(modifiedLines, rangeMapping.modifiedRange)`.
+        // original: ]xxx \n <- this line is not modified
+        // modified: ]xx  \n
+        if (rangeMapping.modifiedRange.endColumn === 1 && rangeMapping.originalRange.endColumn === 1
+            && rangeMapping.originalRange.startLineNumber + lineStartDelta <= rangeMapping.originalRange.endLineNumber
+            && rangeMapping.modifiedRange.startLineNumber + lineStartDelta <= rangeMapping.modifiedRange.endLineNumber) {
+            // We can only do this if the range is not empty yet
+            lineEndDelta = -1;
+        }
+        // original: xxx[ \n <- this line is not modified
+        // modified: xxx[ \n
+        if (rangeMapping.modifiedRange.startColumn - 1 >= modifiedLines[rangeMapping.modifiedRange.startLineNumber - 1].length
+            && rangeMapping.originalRange.startColumn - 1 >= originalLines[rangeMapping.originalRange.startLineNumber - 1].length
+            && rangeMapping.originalRange.startLineNumber <= rangeMapping.originalRange.endLineNumber + lineEndDelta
+            && rangeMapping.modifiedRange.startLineNumber <= rangeMapping.modifiedRange.endLineNumber + lineEndDelta) {
+            // We can only do this if the range is not empty yet
+            lineStartDelta = 1;
+        }
+        const originalLineRange = new LineRange(rangeMapping.originalRange.startLineNumber + lineStartDelta, rangeMapping.originalRange.endLineNumber + 1 + lineEndDelta);
+        const modifiedLineRange = new LineRange(rangeMapping.modifiedRange.startLineNumber + lineStartDelta, rangeMapping.modifiedRange.endLineNumber + 1 + lineEndDelta);
+        return new LineRangeMapping(originalLineRange, modifiedLineRange, [rangeMapping]);
+    }
+    function* group(items, shouldBeGrouped) {
+        let currentGroup;
+        let last;
+        for (const item of items) {
+            if (last !== undefined && shouldBeGrouped(last, item)) {
+                currentGroup.push(item);
+            }
+            else {
+                if (currentGroup) {
+                    yield currentGroup;
+                }
+                currentGroup = [item];
+            }
+            last = item;
+        }
+        if (currentGroup) {
+            yield currentGroup;
+        }
+    }
+    class LineSequence {
+        constructor(trimmedHash, lines) {
+            this.trimmedHash = trimmedHash;
+            this.lines = lines;
+        }
+        getElement(offset) {
+            return this.trimmedHash[offset];
+        }
+        get length() {
+            return this.trimmedHash.length;
+        }
+        getBoundaryScore(length) {
+            const indentationBefore = length === 0 ? 0 : getIndentation(this.lines[length - 1]);
+            const indentationAfter = length === this.lines.length ? 0 : getIndentation(this.lines[length]);
+            return 1000 - (indentationBefore + indentationAfter);
+        }
+    }
+    function getIndentation(str) {
+        let i = 0;
+        while (i < str.length && (str.charCodeAt(i) === 32 /* CharCode.Space */ || str.charCodeAt(i) === 9 /* CharCode.Tab */)) {
+            i++;
+        }
+        return i;
+    }
+    class LinesSliceCharSequence {
+        constructor(lines, lineRange, considerWhitespaceChanges) {
+            // This slice has to have lineRange.length many \n! (otherwise diffing against an empty slice will be problematic)
+            // (Unless it covers the entire document, in that case the other slice also has to cover the entire document ands it's okay)
+            this.lines = lines;
+            this.considerWhitespaceChanges = considerWhitespaceChanges;
+            this.elements = [];
+            this.firstCharOffsetByLineMinusOne = [];
+            // To account for trimming
+            this.offsetByLine = [];
+            // If the slice covers the end, but does not start at the beginning, we include just the \n of the previous line.
+            let trimFirstLineFully = false;
+            if (lineRange.start > 0 && lineRange.endExclusive >= lines.length) {
+                lineRange = new OffsetRange(lineRange.start - 1, lineRange.endExclusive);
+                trimFirstLineFully = true;
+            }
+            this.lineRange = lineRange;
+            for (let i = this.lineRange.start; i < this.lineRange.endExclusive; i++) {
+                let line = lines[i];
+                let offset = 0;
+                if (trimFirstLineFully) {
+                    offset = line.length;
+                    line = '';
+                    trimFirstLineFully = false;
+                }
+                else if (!considerWhitespaceChanges) {
+                    const trimmedStartLine = line.trimStart();
+                    offset = line.length - trimmedStartLine.length;
+                    line = trimmedStartLine.trimEnd();
+                }
+                this.offsetByLine.push(offset);
+                for (let i = 0; i < line.length; i++) {
+                    this.elements.push(line.charCodeAt(i));
+                }
+                // Don't add an \n that does not exist in the document.
+                if (i < lines.length - 1) {
+                    this.elements.push('\n'.charCodeAt(0));
+                    this.firstCharOffsetByLineMinusOne[i - this.lineRange.start] = this.elements.length;
+                }
+            }
+            // To account for the last line
+            this.offsetByLine.push(0);
+        }
+        toString() {
+            return `Slice: "${this.text}"`;
+        }
+        get text() {
+            return this.getText(new OffsetRange(0, this.length));
+        }
+        getText(range) {
+            return this.elements.slice(range.start, range.endExclusive).map(e => String.fromCharCode(e)).join('');
+        }
+        getElement(offset) {
+            return this.elements[offset];
+        }
+        get length() {
+            return this.elements.length;
+        }
+        getBoundaryScore(length) {
+            //   a   b   c   ,           d   e   f
+            // 11  0   0   12  15  6   13  0   0   11
+            const prevCategory = getCategory(length > 0 ? this.elements[length - 1] : -1);
+            const nextCategory = getCategory(length < this.elements.length ? this.elements[length] : -1);
+            if (prevCategory === 6 /* CharBoundaryCategory.LineBreakCR */ && nextCategory === 7 /* CharBoundaryCategory.LineBreakLF */) {
+                // don't break between \r and \n
+                return 0;
+            }
+            let score = 0;
+            if (prevCategory !== nextCategory) {
+                score += 10;
+                if (nextCategory === 1 /* CharBoundaryCategory.WordUpper */) {
+                    score += 1;
+                }
+            }
+            score += getCategoryBoundaryScore(prevCategory);
+            score += getCategoryBoundaryScore(nextCategory);
+            return score;
+        }
+        translateOffset(offset) {
+            // find smallest i, so that lineBreakOffsets[i] <= offset using binary search
+            if (this.lineRange.isEmpty) {
+                return new Position$1(this.lineRange.start + 1, 1);
+            }
+            let i = 0;
+            let j = this.firstCharOffsetByLineMinusOne.length;
+            while (i < j) {
+                const k = Math.floor((i + j) / 2);
+                if (this.firstCharOffsetByLineMinusOne[k] > offset) {
+                    j = k;
+                }
+                else {
+                    i = k + 1;
+                }
+            }
+            const offsetOfFirstCharInLine = i === 0 ? 0 : this.firstCharOffsetByLineMinusOne[i - 1];
+            return new Position$1(this.lineRange.start + i + 1, offset - offsetOfFirstCharInLine + 1 + this.offsetByLine[i]);
+        }
+        translateRange(range) {
+            return Range$1.fromPositions(this.translateOffset(range.start), this.translateOffset(range.endExclusive));
+        }
+        /**
+         * Finds the word that contains the character at the given offset
+         */
+        findWordContaining(offset) {
+            if (offset < 0 || offset >= this.elements.length) {
+                return undefined;
+            }
+            if (!isWordChar(this.elements[offset])) {
+                return undefined;
+            }
+            // find start
+            let start = offset;
+            while (start > 0 && isWordChar(this.elements[start - 1])) {
+                start--;
+            }
+            // find end
+            let end = offset;
+            while (end < this.elements.length && isWordChar(this.elements[end])) {
+                end++;
+            }
+            return new OffsetRange(start, end);
+        }
+        countLinesIn(range) {
+            return this.translateOffset(range.endExclusive).lineNumber - this.translateOffset(range.start).lineNumber;
+        }
+    }
+    function isWordChar(charCode) {
+        return charCode >= 97 /* CharCode.a */ && charCode <= 122 /* CharCode.z */
+            || charCode >= 65 /* CharCode.A */ && charCode <= 90 /* CharCode.Z */
+            || charCode >= 48 /* CharCode.Digit0 */ && charCode <= 57 /* CharCode.Digit9 */;
+    }
+    const score = {
+        [0 /* CharBoundaryCategory.WordLower */]: 0,
+        [1 /* CharBoundaryCategory.WordUpper */]: 0,
+        [2 /* CharBoundaryCategory.WordNumber */]: 0,
+        [3 /* CharBoundaryCategory.End */]: 10,
+        [4 /* CharBoundaryCategory.Other */]: 2,
+        [5 /* CharBoundaryCategory.Space */]: 3,
+        [6 /* CharBoundaryCategory.LineBreakCR */]: 10,
+        [7 /* CharBoundaryCategory.LineBreakLF */]: 10,
+    };
+    function getCategoryBoundaryScore(category) {
+        return score[category];
+    }
+    function getCategory(charCode) {
+        if (charCode === 10 /* CharCode.LineFeed */) {
+            return 7 /* CharBoundaryCategory.LineBreakLF */;
+        }
+        else if (charCode === 13 /* CharCode.CarriageReturn */) {
+            return 6 /* CharBoundaryCategory.LineBreakCR */;
+        }
+        else if (isSpace(charCode)) {
+            return 5 /* CharBoundaryCategory.Space */;
+        }
+        else if (charCode >= 97 /* CharCode.a */ && charCode <= 122 /* CharCode.z */) {
+            return 0 /* CharBoundaryCategory.WordLower */;
+        }
+        else if (charCode >= 65 /* CharCode.A */ && charCode <= 90 /* CharCode.Z */) {
+            return 1 /* CharBoundaryCategory.WordUpper */;
+        }
+        else if (charCode >= 48 /* CharCode.Digit0 */ && charCode <= 57 /* CharCode.Digit9 */) {
+            return 2 /* CharBoundaryCategory.WordNumber */;
+        }
+        else if (charCode === -1) {
+            return 3 /* CharBoundaryCategory.End */;
+        }
+        else {
+            return 4 /* CharBoundaryCategory.Other */;
+        }
+    }
+    function isSpace(charCode) {
+        return charCode === 32 /* CharCode.Space */ || charCode === 9 /* CharCode.Tab */;
+    }
+    const chrKeys = new Map();
+    function getKey(chr) {
+        let key = chrKeys.get(chr);
+        if (key === undefined) {
+            key = chrKeys.size;
+            chrKeys.set(chr, key);
+        }
+        return key;
+    }
+    class LineRangeFragment {
+        constructor(range, lines) {
+            this.range = range;
+            this.lines = lines;
+            this.histogram = [];
+            let counter = 0;
+            for (let i = range.startLineNumber - 1; i < range.endLineNumberExclusive - 1; i++) {
+                const line = lines[i];
+                for (let j = 0; j < line.length; j++) {
+                    counter++;
+                    const chr = line[j];
+                    const key = getKey(chr);
+                    this.histogram[key] = (this.histogram[key] || 0) + 1;
+                }
+                counter++;
+                const key = getKey('\n');
+                this.histogram[key] = (this.histogram[key] || 0) + 1;
+            }
+            this.totalCount = counter;
+        }
+        computeSimilarity(other) {
+            var _a, _b;
+            let sumDifferences = 0;
+            const maxLength = Math.max(this.histogram.length, other.histogram.length);
+            for (let i = 0; i < maxLength; i++) {
+                sumDifferences += Math.abs(((_a = this.histogram[i]) !== null && _a !== void 0 ? _a : 0) - ((_b = other.histogram[i]) !== null && _b !== void 0 ? _b : 0));
+            }
+            return 1 - (sumDifferences / (this.totalCount + other.totalCount));
+        }
+    }
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    const linesDiffComputers = {
+        getLegacy: () => new SmartLinesDiffComputer(),
+        getAdvanced: () => new StandardLinesDiffComputer(),
+    };
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    function roundFloat(number, decimalPoints) {
+        const decimal = Math.pow(10, decimalPoints);
+        return Math.round(number * decimal) / decimal;
+    }
+    class RGBA {
+        constructor(r, g, b, a = 1) {
+            this._rgbaBrand = undefined;
+            this.r = Math.min(255, Math.max(0, r)) | 0;
+            this.g = Math.min(255, Math.max(0, g)) | 0;
+            this.b = Math.min(255, Math.max(0, b)) | 0;
+            this.a = roundFloat(Math.max(Math.min(1, a), 0), 3);
+        }
+        static equals(a, b) {
+            return a.r === b.r && a.g === b.g && a.b === b.b && a.a === b.a;
+        }
+    }
+    class HSLA {
+        constructor(h, s, l, a) {
+            this._hslaBrand = undefined;
+            this.h = Math.max(Math.min(360, h), 0) | 0;
+            this.s = roundFloat(Math.max(Math.min(1, s), 0), 3);
+            this.l = roundFloat(Math.max(Math.min(1, l), 0), 3);
+            this.a = roundFloat(Math.max(Math.min(1, a), 0), 3);
+        }
+        static equals(a, b) {
+            return a.h === b.h && a.s === b.s && a.l === b.l && a.a === b.a;
+        }
+        /**
+         * Converts an RGB color value to HSL. Conversion formula
+         * adapted from http://en.wikipedia.org/wiki/HSL_color_space.
+         * Assumes r, g, and b are contained in the set [0, 255] and
+         * returns h in the set [0, 360], s, and l in the set [0, 1].
+         */
+        static fromRGBA(rgba) {
+            const r = rgba.r / 255;
+            const g = rgba.g / 255;
+            const b = rgba.b / 255;
+            const a = rgba.a;
+            const max = Math.max(r, g, b);
+            const min = Math.min(r, g, b);
+            let h = 0;
+            let s = 0;
+            const l = (min + max) / 2;
+            const chroma = max - min;
+            if (chroma > 0) {
+                s = Math.min((l <= 0.5 ? chroma / (2 * l) : chroma / (2 - (2 * l))), 1);
+                switch (max) {
+                    case r:
+                        h = (g - b) / chroma + (g < b ? 6 : 0);
+                        break;
+                    case g:
+                        h = (b - r) / chroma + 2;
+                        break;
+                    case b:
+                        h = (r - g) / chroma + 4;
+                        break;
+                }
+                h *= 60;
+                h = Math.round(h);
+            }
+            return new HSLA(h, s, l, a);
+        }
+        static _hue2rgb(p, q, t) {
+            if (t < 0) {
+                t += 1;
+            }
+            if (t > 1) {
+                t -= 1;
+            }
+            if (t < 1 / 6) {
+                return p + (q - p) * 6 * t;
+            }
+            if (t < 1 / 2) {
+                return q;
+            }
+            if (t < 2 / 3) {
+                return p + (q - p) * (2 / 3 - t) * 6;
+            }
+            return p;
+        }
+        /**
+         * Converts an HSL color value to RGB. Conversion formula
+         * adapted from http://en.wikipedia.org/wiki/HSL_color_space.
+         * Assumes h in the set [0, 360] s, and l are contained in the set [0, 1] and
+         * returns r, g, and b in the set [0, 255].
+         */
+        static toRGBA(hsla) {
+            const h = hsla.h / 360;
+            const { s, l, a } = hsla;
+            let r, g, b;
+            if (s === 0) {
+                r = g = b = l; // achromatic
+            }
+            else {
+                const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+                const p = 2 * l - q;
+                r = HSLA._hue2rgb(p, q, h + 1 / 3);
+                g = HSLA._hue2rgb(p, q, h);
+                b = HSLA._hue2rgb(p, q, h - 1 / 3);
+            }
+            return new RGBA(Math.round(r * 255), Math.round(g * 255), Math.round(b * 255), a);
+        }
+    }
+    class HSVA {
+        constructor(h, s, v, a) {
+            this._hsvaBrand = undefined;
+            this.h = Math.max(Math.min(360, h), 0) | 0;
+            this.s = roundFloat(Math.max(Math.min(1, s), 0), 3);
+            this.v = roundFloat(Math.max(Math.min(1, v), 0), 3);
+            this.a = roundFloat(Math.max(Math.min(1, a), 0), 3);
+        }
+        static equals(a, b) {
+            return a.h === b.h && a.s === b.s && a.v === b.v && a.a === b.a;
+        }
+        // from http://www.rapidtables.com/convert/color/rgb-to-hsv.htm
+        static fromRGBA(rgba) {
+            const r = rgba.r / 255;
+            const g = rgba.g / 255;
+            const b = rgba.b / 255;
+            const cmax = Math.max(r, g, b);
+            const cmin = Math.min(r, g, b);
+            const delta = cmax - cmin;
+            const s = cmax === 0 ? 0 : (delta / cmax);
+            let m;
+            if (delta === 0) {
+                m = 0;
+            }
+            else if (cmax === r) {
+                m = ((((g - b) / delta) % 6) + 6) % 6;
+            }
+            else if (cmax === g) {
+                m = ((b - r) / delta) + 2;
+            }
+            else {
+                m = ((r - g) / delta) + 4;
+            }
+            return new HSVA(Math.round(m * 60), s, cmax, rgba.a);
+        }
+        // from http://www.rapidtables.com/convert/color/hsv-to-rgb.htm
+        static toRGBA(hsva) {
+            const { h, s, v, a } = hsva;
+            const c = v * s;
+            const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+            const m = v - c;
+            let [r, g, b] = [0, 0, 0];
+            if (h < 60) {
+                r = c;
+                g = x;
+            }
+            else if (h < 120) {
+                r = x;
+                g = c;
+            }
+            else if (h < 180) {
+                g = c;
+                b = x;
+            }
+            else if (h < 240) {
+                g = x;
+                b = c;
+            }
+            else if (h < 300) {
+                r = x;
+                b = c;
+            }
+            else if (h <= 360) {
+                r = c;
+                b = x;
+            }
+            r = Math.round((r + m) * 255);
+            g = Math.round((g + m) * 255);
+            b = Math.round((b + m) * 255);
+            return new RGBA(r, g, b, a);
+        }
+    }
+    class Color$1 {
+        static fromHex(hex) {
+            return Color$1.Format.CSS.parseHex(hex) || Color$1.red;
+        }
+        static equals(a, b) {
+            if (!a && !b) {
+                return true;
+            }
+            if (!a || !b) {
+                return false;
+            }
+            return a.equals(b);
+        }
+        get hsla() {
+            if (this._hsla) {
+                return this._hsla;
+            }
+            else {
+                return HSLA.fromRGBA(this.rgba);
+            }
+        }
+        get hsva() {
+            if (this._hsva) {
+                return this._hsva;
+            }
+            return HSVA.fromRGBA(this.rgba);
+        }
+        constructor(arg) {
+            if (!arg) {
+                throw new Error('Color needs a value');
+            }
+            else if (arg instanceof RGBA) {
+                this.rgba = arg;
+            }
+            else if (arg instanceof HSLA) {
+                this._hsla = arg;
+                this.rgba = HSLA.toRGBA(arg);
+            }
+            else if (arg instanceof HSVA) {
+                this._hsva = arg;
+                this.rgba = HSVA.toRGBA(arg);
+            }
+            else {
+                throw new Error('Invalid color ctor argument');
+            }
+        }
+        equals(other) {
+            return !!other && RGBA.equals(this.rgba, other.rgba) && HSLA.equals(this.hsla, other.hsla) && HSVA.equals(this.hsva, other.hsva);
+        }
+        /**
+         * http://www.w3.org/TR/WCAG20/#relativeluminancedef
+         * Returns the number in the set [0, 1]. O => Darkest Black. 1 => Lightest white.
+         */
+        getRelativeLuminance() {
+            const R = Color$1._relativeLuminanceForComponent(this.rgba.r);
+            const G = Color$1._relativeLuminanceForComponent(this.rgba.g);
+            const B = Color$1._relativeLuminanceForComponent(this.rgba.b);
+            const luminance = 0.2126 * R + 0.7152 * G + 0.0722 * B;
+            return roundFloat(luminance, 4);
+        }
+        static _relativeLuminanceForComponent(color) {
+            const c = color / 255;
+            return (c <= 0.03928) ? c / 12.92 : Math.pow(((c + 0.055) / 1.055), 2.4);
+        }
+        /**
+         *	http://24ways.org/2010/calculating-color-contrast
+         *  Return 'true' if lighter color otherwise 'false'
+         */
+        isLighter() {
+            const yiq = (this.rgba.r * 299 + this.rgba.g * 587 + this.rgba.b * 114) / 1000;
+            return yiq >= 128;
+        }
+        isLighterThan(another) {
+            const lum1 = this.getRelativeLuminance();
+            const lum2 = another.getRelativeLuminance();
+            return lum1 > lum2;
+        }
+        isDarkerThan(another) {
+            const lum1 = this.getRelativeLuminance();
+            const lum2 = another.getRelativeLuminance();
+            return lum1 < lum2;
+        }
+        lighten(factor) {
+            return new Color$1(new HSLA(this.hsla.h, this.hsla.s, this.hsla.l + this.hsla.l * factor, this.hsla.a));
+        }
+        darken(factor) {
+            return new Color$1(new HSLA(this.hsla.h, this.hsla.s, this.hsla.l - this.hsla.l * factor, this.hsla.a));
+        }
+        transparent(factor) {
+            const { r, g, b, a } = this.rgba;
+            return new Color$1(new RGBA(r, g, b, a * factor));
+        }
+        isTransparent() {
+            return this.rgba.a === 0;
+        }
+        isOpaque() {
+            return this.rgba.a === 1;
+        }
+        opposite() {
+            return new Color$1(new RGBA(255 - this.rgba.r, 255 - this.rgba.g, 255 - this.rgba.b, this.rgba.a));
+        }
+        makeOpaque(opaqueBackground) {
+            if (this.isOpaque() || opaqueBackground.rgba.a !== 1) {
+                // only allow to blend onto a non-opaque color onto a opaque color
+                return this;
+            }
+            const { r, g, b, a } = this.rgba;
+            // https://stackoverflow.com/questions/12228548/finding-equivalent-color-with-opacity
+            return new Color$1(new RGBA(opaqueBackground.rgba.r - a * (opaqueBackground.rgba.r - r), opaqueBackground.rgba.g - a * (opaqueBackground.rgba.g - g), opaqueBackground.rgba.b - a * (opaqueBackground.rgba.b - b), 1));
+        }
+        toString() {
+            if (!this._toString) {
+                this._toString = Color$1.Format.CSS.format(this);
+            }
+            return this._toString;
+        }
+        static getLighterColor(of, relative, factor) {
+            if (of.isLighterThan(relative)) {
+                return of;
+            }
+            factor = factor ? factor : 0.5;
+            const lum1 = of.getRelativeLuminance();
+            const lum2 = relative.getRelativeLuminance();
+            factor = factor * (lum2 - lum1) / lum2;
+            return of.lighten(factor);
+        }
+        static getDarkerColor(of, relative, factor) {
+            if (of.isDarkerThan(relative)) {
+                return of;
+            }
+            factor = factor ? factor : 0.5;
+            const lum1 = of.getRelativeLuminance();
+            const lum2 = relative.getRelativeLuminance();
+            factor = factor * (lum1 - lum2) / lum1;
+            return of.darken(factor);
+        }
+    }
+    Color$1.white = new Color$1(new RGBA(255, 255, 255, 1));
+    Color$1.black = new Color$1(new RGBA(0, 0, 0, 1));
+    Color$1.red = new Color$1(new RGBA(255, 0, 0, 1));
+    Color$1.blue = new Color$1(new RGBA(0, 0, 255, 1));
+    Color$1.green = new Color$1(new RGBA(0, 255, 0, 1));
+    Color$1.cyan = new Color$1(new RGBA(0, 255, 255, 1));
+    Color$1.lightgrey = new Color$1(new RGBA(211, 211, 211, 1));
+    Color$1.transparent = new Color$1(new RGBA(0, 0, 0, 0));
+    (function (Color) {
+        (function (Format) {
+            (function (CSS) {
+                function formatRGB(color) {
+                    if (color.rgba.a === 1) {
+                        return `rgb(${color.rgba.r}, ${color.rgba.g}, ${color.rgba.b})`;
+                    }
+                    return Color.Format.CSS.formatRGBA(color);
+                }
+                CSS.formatRGB = formatRGB;
+                function formatRGBA(color) {
+                    return `rgba(${color.rgba.r}, ${color.rgba.g}, ${color.rgba.b}, ${+(color.rgba.a).toFixed(2)})`;
+                }
+                CSS.formatRGBA = formatRGBA;
+                function formatHSL(color) {
+                    if (color.hsla.a === 1) {
+                        return `hsl(${color.hsla.h}, ${(color.hsla.s * 100).toFixed(2)}%, ${(color.hsla.l * 100).toFixed(2)}%)`;
+                    }
+                    return Color.Format.CSS.formatHSLA(color);
+                }
+                CSS.formatHSL = formatHSL;
+                function formatHSLA(color) {
+                    return `hsla(${color.hsla.h}, ${(color.hsla.s * 100).toFixed(2)}%, ${(color.hsla.l * 100).toFixed(2)}%, ${color.hsla.a.toFixed(2)})`;
+                }
+                CSS.formatHSLA = formatHSLA;
+                function _toTwoDigitHex(n) {
+                    const r = n.toString(16);
+                    return r.length !== 2 ? '0' + r : r;
+                }
+                /**
+                 * Formats the color as #RRGGBB
+                 */
+                function formatHex(color) {
+                    return `#${_toTwoDigitHex(color.rgba.r)}${_toTwoDigitHex(color.rgba.g)}${_toTwoDigitHex(color.rgba.b)}`;
+                }
+                CSS.formatHex = formatHex;
+                /**
+                 * Formats the color as #RRGGBBAA
+                 * If 'compact' is set, colors without transparancy will be printed as #RRGGBB
+                 */
+                function formatHexA(color, compact = false) {
+                    if (compact && color.rgba.a === 1) {
+                        return Color.Format.CSS.formatHex(color);
+                    }
+                    return `#${_toTwoDigitHex(color.rgba.r)}${_toTwoDigitHex(color.rgba.g)}${_toTwoDigitHex(color.rgba.b)}${_toTwoDigitHex(Math.round(color.rgba.a * 255))}`;
+                }
+                CSS.formatHexA = formatHexA;
+                /**
+                 * The default format will use HEX if opaque and RGBA otherwise.
+                 */
+                function format(color) {
+                    if (color.isOpaque()) {
+                        return Color.Format.CSS.formatHex(color);
+                    }
+                    return Color.Format.CSS.formatRGBA(color);
+                }
+                CSS.format = format;
+                /**
+                 * Converts an Hex color value to a Color.
+                 * returns r, g, and b are contained in the set [0, 255]
+                 * @param hex string (#RGB, #RGBA, #RRGGBB or #RRGGBBAA).
+                 */
+                function parseHex(hex) {
+                    const length = hex.length;
+                    if (length === 0) {
+                        // Invalid color
+                        return null;
+                    }
+                    if (hex.charCodeAt(0) !== 35 /* CharCode.Hash */) {
+                        // Does not begin with a #
+                        return null;
+                    }
+                    if (length === 7) {
+                        // #RRGGBB format
+                        const r = 16 * _parseHexDigit(hex.charCodeAt(1)) + _parseHexDigit(hex.charCodeAt(2));
+                        const g = 16 * _parseHexDigit(hex.charCodeAt(3)) + _parseHexDigit(hex.charCodeAt(4));
+                        const b = 16 * _parseHexDigit(hex.charCodeAt(5)) + _parseHexDigit(hex.charCodeAt(6));
+                        return new Color(new RGBA(r, g, b, 1));
+                    }
+                    if (length === 9) {
+                        // #RRGGBBAA format
+                        const r = 16 * _parseHexDigit(hex.charCodeAt(1)) + _parseHexDigit(hex.charCodeAt(2));
+                        const g = 16 * _parseHexDigit(hex.charCodeAt(3)) + _parseHexDigit(hex.charCodeAt(4));
+                        const b = 16 * _parseHexDigit(hex.charCodeAt(5)) + _parseHexDigit(hex.charCodeAt(6));
+                        const a = 16 * _parseHexDigit(hex.charCodeAt(7)) + _parseHexDigit(hex.charCodeAt(8));
+                        return new Color(new RGBA(r, g, b, a / 255));
+                    }
+                    if (length === 4) {
+                        // #RGB format
+                        const r = _parseHexDigit(hex.charCodeAt(1));
+                        const g = _parseHexDigit(hex.charCodeAt(2));
+                        const b = _parseHexDigit(hex.charCodeAt(3));
+                        return new Color(new RGBA(16 * r + r, 16 * g + g, 16 * b + b));
+                    }
+                    if (length === 5) {
+                        // #RGBA format
+                        const r = _parseHexDigit(hex.charCodeAt(1));
+                        const g = _parseHexDigit(hex.charCodeAt(2));
+                        const b = _parseHexDigit(hex.charCodeAt(3));
+                        const a = _parseHexDigit(hex.charCodeAt(4));
+                        return new Color(new RGBA(16 * r + r, 16 * g + g, 16 * b + b, (16 * a + a) / 255));
+                    }
+                    // Invalid color
+                    return null;
+                }
+                CSS.parseHex = parseHex;
+                function _parseHexDigit(charCode) {
+                    switch (charCode) {
+                        case 48 /* CharCode.Digit0 */: return 0;
+                        case 49 /* CharCode.Digit1 */: return 1;
+                        case 50 /* CharCode.Digit2 */: return 2;
+                        case 51 /* CharCode.Digit3 */: return 3;
+                        case 52 /* CharCode.Digit4 */: return 4;
+                        case 53 /* CharCode.Digit5 */: return 5;
+                        case 54 /* CharCode.Digit6 */: return 6;
+                        case 55 /* CharCode.Digit7 */: return 7;
+                        case 56 /* CharCode.Digit8 */: return 8;
+                        case 57 /* CharCode.Digit9 */: return 9;
+                        case 97 /* CharCode.a */: return 10;
+                        case 65 /* CharCode.A */: return 10;
+                        case 98 /* CharCode.b */: return 11;
+                        case 66 /* CharCode.B */: return 11;
+                        case 99 /* CharCode.c */: return 12;
+                        case 67 /* CharCode.C */: return 12;
+                        case 100 /* CharCode.d */: return 13;
+                        case 68 /* CharCode.D */: return 13;
+                        case 101 /* CharCode.e */: return 14;
+                        case 69 /* CharCode.E */: return 14;
+                        case 102 /* CharCode.f */: return 15;
+                        case 70 /* CharCode.F */: return 15;
+                    }
+                    return 0;
+                }
+            })(Format.CSS || (Format.CSS = {}));
+        })(Color.Format || (Color.Format = {}));
+    })(Color$1 || (Color$1 = {}));
+
+    /*---------------------------------------------------------------------------------------------
+     *  Copyright (c) Microsoft Corporation. All rights reserved.
+     *  Licensed under the MIT License. See License.txt in the project root for license information.
+     *--------------------------------------------------------------------------------------------*/
+    function _parseCaptureGroups(captureGroups) {
+        const values = [];
+        for (const captureGroup of captureGroups) {
+            const parsedNumber = Number(captureGroup);
+            if (parsedNumber || parsedNumber === 0 && captureGroup.replace(/\s/g, '') !== '') {
+                values.push(parsedNumber);
+            }
+        }
+        return values;
+    }
+    function _toIColor(r, g, b, a) {
+        return {
+            red: r / 255,
+            blue: b / 255,
+            green: g / 255,
+            alpha: a
+        };
+    }
+    function _findRange(model, match) {
+        const index = match.index;
+        const length = match[0].length;
+        if (!index) {
+            return;
+        }
+        const startPosition = model.positionAt(index);
+        const range = {
+            startLineNumber: startPosition.lineNumber,
+            startColumn: startPosition.column,
+            endLineNumber: startPosition.lineNumber,
+            endColumn: startPosition.column + length
+        };
+        return range;
+    }
+    function _findHexColorInformation(range, hexValue) {
+        if (!range) {
+            return;
+        }
+        const parsedHexColor = Color$1.Format.CSS.parseHex(hexValue);
+        if (!parsedHexColor) {
+            return;
+        }
+        return {
+            range: range,
+            color: _toIColor(parsedHexColor.rgba.r, parsedHexColor.rgba.g, parsedHexColor.rgba.b, parsedHexColor.rgba.a)
+        };
+    }
+    function _findRGBColorInformation(range, matches, isAlpha) {
+        if (!range || matches.length !== 1) {
+            return;
+        }
+        const match = matches[0];
+        const captureGroups = match.values();
+        const parsedRegex = _parseCaptureGroups(captureGroups);
+        return {
+            range: range,
+            color: _toIColor(parsedRegex[0], parsedRegex[1], parsedRegex[2], isAlpha ? parsedRegex[3] : 1)
+        };
+    }
+    function _findHSLColorInformation(range, matches, isAlpha) {
+        if (!range || matches.length !== 1) {
+            return;
+        }
+        const match = matches[0];
+        const captureGroups = match.values();
+        const parsedRegex = _parseCaptureGroups(captureGroups);
+        const colorEquivalent = new Color$1(new HSLA(parsedRegex[0], parsedRegex[1] / 100, parsedRegex[2] / 100, isAlpha ? parsedRegex[3] : 1));
+        return {
+            range: range,
+            color: _toIColor(colorEquivalent.rgba.r, colorEquivalent.rgba.g, colorEquivalent.rgba.b, colorEquivalent.rgba.a)
+        };
+    }
+    function _findMatches(model, regex) {
+        if (typeof model === 'string') {
+            return [...model.matchAll(regex)];
+        }
+        else {
+            return model.findMatches(regex);
+        }
+    }
+    function computeColors(model) {
+        const result = [];
+        // Early validation for RGB and HSL
+        const initialValidationRegex = /\b(rgb|rgba|hsl|hsla)(\([0-9\s,.\%]*\))|(#)([A-Fa-f0-9]{3})\b|(#)([A-Fa-f0-9]{4})\b|(#)([A-Fa-f0-9]{6})\b|(#)([A-Fa-f0-9]{8})\b/gm;
+        const initialValidationMatches = _findMatches(model, initialValidationRegex);
+        // Potential colors have been found, validate the parameters
+        if (initialValidationMatches.length > 0) {
+            for (const initialMatch of initialValidationMatches) {
+                const initialCaptureGroups = initialMatch.filter(captureGroup => captureGroup !== undefined);
+                const colorScheme = initialCaptureGroups[1];
+                const colorParameters = initialCaptureGroups[2];
+                if (!colorParameters) {
+                    continue;
+                }
+                let colorInformation;
+                if (colorScheme === 'rgb') {
+                    const regexParameters = /^\(\s*(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\s*,\s*(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\s*,\s*(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\s*\)$/gm;
+                    colorInformation = _findRGBColorInformation(_findRange(model, initialMatch), _findMatches(colorParameters, regexParameters), false);
+                }
+                else if (colorScheme === 'rgba') {
+                    const regexParameters = /^\(\s*(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\s*,\s*(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\s*,\s*(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])\s*,\s*(0[.][0-9]+|[.][0-9]+|[01][.]|[01])\s*\)$/gm;
+                    colorInformation = _findRGBColorInformation(_findRange(model, initialMatch), _findMatches(colorParameters, regexParameters), true);
+                }
+                else if (colorScheme === 'hsl') {
+                    const regexParameters = /^\(\s*(36[0]|3[0-5][0-9]|[12][0-9][0-9]|[1-9]?[0-9])\s*,\s*(100|\d{1,2}[.]\d*|\d{1,2})%\s*,\s*(100|\d{1,2}[.]\d*|\d{1,2})%\s*\)$/gm;
+                    colorInformation = _findHSLColorInformation(_findRange(model, initialMatch), _findMatches(colorParameters, regexParameters), false);
+                }
+                else if (colorScheme === 'hsla') {
+                    const regexParameters = /^\(\s*(36[0]|3[0-5][0-9]|[12][0-9][0-9]|[1-9]?[0-9])\s*,\s*(100|\d{1,2}[.]\d*|\d{1,2})%\s*,\s*(100|\d{1,2}[.]\d*|\d{1,2})%\s*,\s*(0[.][0-9]+|[.][0-9]+|[01][.]|[01])\s*\)$/gm;
+                    colorInformation = _findHSLColorInformation(_findRange(model, initialMatch), _findMatches(colorParameters, regexParameters), true);
+                }
+                else if (colorScheme === '#') {
+                    colorInformation = _findHexColorInformation(_findRange(model, initialMatch), colorScheme + colorParameters);
+                }
+                if (colorInformation) {
+                    result.push(colorInformation);
+                }
+            }
+        }
+        return result;
+    }
+    /**
+     * Returns an array of all default document colors in the provided document
+     */
+    function computeDefaultDocumentColors(model) {
+        if (!model || typeof model.getValue !== 'function' || typeof model.positionAt !== 'function') {
+            // Unknown caller!
+            return [];
+        }
+        return computeColors(model);
     }
 
     /*---------------------------------------------------------------------------------------------
@@ -10678,6 +11915,21 @@
         }
         getValue() {
             return this.getText();
+        }
+        findMatches(regex) {
+            const matches = [];
+            for (let i = 0; i < this._lines.length; i++) {
+                const line = this._lines[i];
+                const offsetToAdd = this.offsetAt(new Position$1(i + 1, 1));
+                const iteratorOverMatches = line.matchAll(regex);
+                for (const match of iteratorOverMatches) {
+                    if (match.index || match.index === 0) {
+                        match.index = match.index + offsetToAdd;
+                    }
+                    matches.push(match);
+                }
+            }
+            return matches;
         }
         getLinesContent() {
             return this._lines.slice(0);
@@ -10882,32 +12134,51 @@
             });
         }
         // ---- BEGIN diff --------------------------------------------------------------------------
-        computeDiff(originalUrl, modifiedUrl, ignoreTrimWhitespace, maxComputationTime) {
+        computeDiff(originalUrl, modifiedUrl, options, algorithm) {
             return __awaiter$1(this, void 0, void 0, function* () {
                 const original = this._getModel(originalUrl);
                 const modified = this._getModel(modifiedUrl);
                 if (!original || !modified) {
                     return null;
                 }
-                const originalLines = original.getLinesContent();
-                const modifiedLines = modified.getLinesContent();
-                const diffComputer = new DiffComputer(originalLines, modifiedLines, {
-                    shouldComputeCharChanges: true,
-                    shouldPostProcessCharChanges: true,
-                    shouldIgnoreTrimWhitespace: ignoreTrimWhitespace,
-                    shouldMakePrettyDiff: true,
-                    maxComputationTime: maxComputationTime
-                });
-                const diffResult = diffComputer.computeDiff();
-                const identical = (diffResult.changes.length > 0 ? false : this._modelsAreIdentical(original, modified));
-                return {
-                    quitEarly: diffResult.quitEarly,
-                    identical: identical,
-                    changes: diffResult.changes
-                };
+                return EditorSimpleWorker.computeDiff(original, modified, options, algorithm);
             });
         }
-        _modelsAreIdentical(original, modified) {
+        static computeDiff(originalTextModel, modifiedTextModel, options, algorithm) {
+            const diffAlgorithm = algorithm === 'advanced' ? linesDiffComputers.getAdvanced() : linesDiffComputers.getLegacy();
+            const originalLines = originalTextModel.getLinesContent();
+            const modifiedLines = modifiedTextModel.getLinesContent();
+            const result = diffAlgorithm.computeDiff(originalLines, modifiedLines, options);
+            const identical = (result.changes.length > 0 ? false : this._modelsAreIdentical(originalTextModel, modifiedTextModel));
+            function getLineChanges(changes) {
+                return changes.map(m => {
+                    var _a;
+                    return ([m.originalRange.startLineNumber, m.originalRange.endLineNumberExclusive, m.modifiedRange.startLineNumber, m.modifiedRange.endLineNumberExclusive, (_a = m.innerChanges) === null || _a === void 0 ? void 0 : _a.map(m => [
+                            m.originalRange.startLineNumber,
+                            m.originalRange.startColumn,
+                            m.originalRange.endLineNumber,
+                            m.originalRange.endColumn,
+                            m.modifiedRange.startLineNumber,
+                            m.modifiedRange.startColumn,
+                            m.modifiedRange.endLineNumber,
+                            m.modifiedRange.endColumn,
+                        ])]);
+                });
+            }
+            return {
+                identical,
+                quitEarly: result.hitTimeout,
+                changes: getLineChanges(result.changes),
+                moves: result.moves.map(m => ([
+                    m.lineRangeMapping.original.startLineNumber,
+                    m.lineRangeMapping.original.endLineNumberExclusive,
+                    m.lineRangeMapping.modified.startLineNumber,
+                    m.lineRangeMapping.modified.endLineNumberExclusive,
+                    getLineChanges(m.changes)
+                ])),
+            };
+        }
+        static _modelsAreIdentical(original, modified) {
             const originalLineCount = original.getLineCount();
             const modifiedLineCount = modified.getLineCount();
             if (originalLineCount !== modifiedLineCount) {
@@ -10922,7 +12193,7 @@
             }
             return true;
         }
-        computeMoreMinimalEdits(modelUrl, edits) {
+        computeMoreMinimalEdits(modelUrl, edits, pretty) {
             return __awaiter$1(this, void 0, void 0, function* () {
                 const model = this._getModel(modelUrl);
                 if (!model) {
@@ -10959,7 +12230,7 @@
                         continue;
                     }
                     // compute diff between original and edit.text
-                    const changes = stringDiff(original, text, false);
+                    const changes = stringDiff(original, text, pretty);
                     const editOffset = model.offsetAt(Range$1.lift(range).getStartPosition());
                     for (const change of changes) {
                         const start = model.positionAt(editOffset + change.originalStart);
@@ -10989,17 +12260,27 @@
                 return computeLinks(model);
             });
         }
+        // --- BEGIN default document colors -----------------------------------------------------------
+        computeDefaultDocumentColors(modelUrl) {
+            return __awaiter$1(this, void 0, void 0, function* () {
+                const model = this._getModel(modelUrl);
+                if (!model) {
+                    return null;
+                }
+                return computeDefaultDocumentColors(model);
+            });
+        }
         textualSuggest(modelUrls, leadingWord, wordDef, wordDefFlags) {
             return __awaiter$1(this, void 0, void 0, function* () {
-                const sw = new StopWatch(true);
+                const sw = new StopWatch();
                 const wordDefRegExp = new RegExp(wordDef, wordDefFlags);
                 const seen = new Set();
-                outer: for (let url of modelUrls) {
+                outer: for (const url of modelUrls) {
                     const model = this._getModel(url);
                     if (!model) {
                         continue;
                     }
-                    for (let word of model.words(wordDefRegExp)) {
+                    for (const word of model.words(wordDefRegExp)) {
                         if (word === leadingWord || !isNaN(Number(word))) {
                             continue;
                         }
@@ -11092,7 +12373,7 @@
             // 			require([moduleId], (foreignModule: { create: IForeignModuleFactory }) => {
             // 				this._foreignModule = foreignModule.create(ctx, createData);
             // 
-            // 				resolve(types.getAllMethodNames(this._foreignModule));
+            // 				resolve(getAllMethodNames(this._foreignModule));
             // 
             // 			}, reject);
             // 		});
@@ -11121,7 +12402,7 @@
     EditorSimpleWorker._suggestionsLimit = 10000;
     if (typeof importScripts === 'function') {
         // Running in a web worker
-        globals.monaco = createMonacoBaseAPI();
+        globalThis.monaco = createMonacoBaseAPI();
     }
 
     /*---------------------------------------------------------------------------------------------
@@ -11135,13 +12416,13 @@
         }
         initialized = true;
         const simpleWorker = new SimpleWorkerServer((msg) => {
-            self.postMessage(msg);
+            globalThis.postMessage(msg);
         }, (host) => new EditorSimpleWorker(host, foreignModule));
-        self.onmessage = (e) => {
+        globalThis.onmessage = (e) => {
             simpleWorker.onmessage(e.data);
         };
     }
-    self.onmessage = (e) => {
+    globalThis.onmessage = (e) => {
         // Ignore first message in this case and initialize if not yet initialized
         if (!initialized) {
             initialize(null);
@@ -11150,7 +12431,7 @@
 
     /*!-----------------------------------------------------------------------------
      * Copyright (c) Microsoft Corporation. All rights reserved.
-     * Version: 0.32.1(29a273516805a852aa8edc5e05059f119b13eff0)
+     * Version: 0.41.0(38e1e3d097f84e336c311d071a9ffb5191d4ffd1)
      * Released under the MIT license
      * https://github.com/microsoft/monaco-editor/blob/main/LICENSE.txt
      *-----------------------------------------------------------------------------*/
@@ -15717,11 +16998,11 @@
         }
         if (doesSupportMarkdown) {
           result.value += item.references.map(function(r) {
-            return "[" + r.name + "](" + r.url + ")";
+            return "[".concat(r.name, "](").concat(r.url, ")");
           }).join(" | ");
         } else {
           result.value += item.references.map(function(r) {
-            return r.name + ": " + r.url;
+            return "".concat(r.name, ": ").concat(r.url);
           }).join("\n");
         }
       }
@@ -16359,7 +17640,7 @@
         function collectDataAttributesSuggestions(range, seenAttributes) {
           var dataAttr = "data-";
           var dataAttributes = {};
-          dataAttributes[dataAttr] = dataAttr + '$1="$2"';
+          dataAttributes[dataAttr] = "".concat(dataAttr, '$1="$2"');
           function addNodeDataAttributes(node2) {
             node2.attributeNames.forEach(function(attr) {
               if (startsWith(attr, dataAttr) && !dataAttributes[attr] && !seenAttributes[attr]) {
@@ -16467,7 +17748,7 @@
                 result.items.push({
                   label,
                   kind: CompletionItemKind.Keyword,
-                  documentation: localize3("entity.propose", "Character entity representing '" + entities[entity] + "'"),
+                  documentation: localize3("entity.propose", "Character entity representing '".concat(entities[entity], "'")),
                   textEdit: TextEdit.replace(range, label),
                   insertTextFormat: InsertTextFormat.PlainText
                 });
@@ -16632,7 +17913,7 @@
             var token = scanner.scan();
             while (token !== TokenType.EOS && scanner.getTokenEnd() <= offset) {
               if (token === TokenType.StartTagClose && scanner.getTokenEnd() === offset) {
-                return "$0</" + node.tag + ">";
+                return "$0</".concat(node.tag, ">");
               }
               token = scanner.scan();
             }
@@ -16647,7 +17928,7 @@
             var token = scanner.scan();
             while (token !== TokenType.EOS && scanner.getTokenEnd() <= offset) {
               if (token === TokenType.EndTagOpen && scanner.getTokenEnd() === offset) {
-                return node.tag + ">";
+                return "".concat(node.tag, ">");
               }
               token = scanner.scan();
             }
@@ -16825,7 +18106,7 @@
                 }
               }
               hex += code;
-              var contentsDoc = localize4("entity.propose", "Character entity representing '" + entities[entity] + "', unicode equivalent '" + hex + "'");
+              var contentsDoc = localize4("entity.propose", "Character entity representing '".concat(entities[entity], "', unicode equivalent '").concat(hex, "'"));
               if (contentsDoc) {
                 hover = { contents: contentsDoc, range };
               } else {
@@ -20105,7 +21386,7 @@
     LIB = (() => {
       var t = { 470: (t2) => {
         function e2(t3) {
-          if (typeof t3 != "string")
+          if ("string" != typeof t3)
             throw new TypeError("Path must be a string. Received " + JSON.stringify(t3));
         }
         function r2(t3, e3) {
@@ -20113,22 +21394,22 @@
             if (h < t3.length)
               r3 = t3.charCodeAt(h);
             else {
-              if (r3 === 47)
+              if (47 === r3)
                 break;
               r3 = 47;
             }
-            if (r3 === 47) {
-              if (i === h - 1 || a === 1)
+            if (47 === r3) {
+              if (i === h - 1 || 1 === a)
                 ;
-              else if (i !== h - 1 && a === 2) {
-                if (n2.length < 2 || o !== 2 || n2.charCodeAt(n2.length - 1) !== 46 || n2.charCodeAt(n2.length - 2) !== 46) {
+              else if (i !== h - 1 && 2 === a) {
+                if (n2.length < 2 || 2 !== o || 46 !== n2.charCodeAt(n2.length - 1) || 46 !== n2.charCodeAt(n2.length - 2)) {
                   if (n2.length > 2) {
                     var s = n2.lastIndexOf("/");
                     if (s !== n2.length - 1) {
-                      s === -1 ? (n2 = "", o = 0) : o = (n2 = n2.slice(0, s)).length - 1 - n2.lastIndexOf("/"), i = h, a = 0;
+                      -1 === s ? (n2 = "", o = 0) : o = (n2 = n2.slice(0, s)).length - 1 - n2.lastIndexOf("/"), i = h, a = 0;
                       continue;
                     }
-                  } else if (n2.length === 2 || n2.length === 1) {
+                  } else if (2 === n2.length || 1 === n2.length) {
                     n2 = "", o = 0, i = h, a = 0;
                     continue;
                   }
@@ -20138,118 +21419,118 @@
                 n2.length > 0 ? n2 += "/" + t3.slice(i + 1, h) : n2 = t3.slice(i + 1, h), o = h - i - 1;
               i = h, a = 0;
             } else
-              r3 === 46 && a !== -1 ? ++a : a = -1;
+              46 === r3 && -1 !== a ? ++a : a = -1;
           }
           return n2;
         }
         var n = { resolve: function() {
           for (var t3, n2 = "", o = false, i = arguments.length - 1; i >= -1 && !o; i--) {
             var a;
-            i >= 0 ? a = arguments[i] : (t3 === void 0 && (t3 = process.cwd()), a = t3), e2(a), a.length !== 0 && (n2 = a + "/" + n2, o = a.charCodeAt(0) === 47);
+            i >= 0 ? a = arguments[i] : (void 0 === t3 && (t3 = process.cwd()), a = t3), e2(a), 0 !== a.length && (n2 = a + "/" + n2, o = 47 === a.charCodeAt(0));
           }
           return n2 = r2(n2, !o), o ? n2.length > 0 ? "/" + n2 : "/" : n2.length > 0 ? n2 : ".";
         }, normalize: function(t3) {
-          if (e2(t3), t3.length === 0)
+          if (e2(t3), 0 === t3.length)
             return ".";
-          var n2 = t3.charCodeAt(0) === 47, o = t3.charCodeAt(t3.length - 1) === 47;
-          return (t3 = r2(t3, !n2)).length !== 0 || n2 || (t3 = "."), t3.length > 0 && o && (t3 += "/"), n2 ? "/" + t3 : t3;
+          var n2 = 47 === t3.charCodeAt(0), o = 47 === t3.charCodeAt(t3.length - 1);
+          return 0 !== (t3 = r2(t3, !n2)).length || n2 || (t3 = "."), t3.length > 0 && o && (t3 += "/"), n2 ? "/" + t3 : t3;
         }, isAbsolute: function(t3) {
-          return e2(t3), t3.length > 0 && t3.charCodeAt(0) === 47;
+          return e2(t3), t3.length > 0 && 47 === t3.charCodeAt(0);
         }, join: function() {
-          if (arguments.length === 0)
+          if (0 === arguments.length)
             return ".";
           for (var t3, r3 = 0; r3 < arguments.length; ++r3) {
             var o = arguments[r3];
-            e2(o), o.length > 0 && (t3 === void 0 ? t3 = o : t3 += "/" + o);
+            e2(o), o.length > 0 && (void 0 === t3 ? t3 = o : t3 += "/" + o);
           }
-          return t3 === void 0 ? "." : n.normalize(t3);
+          return void 0 === t3 ? "." : n.normalize(t3);
         }, relative: function(t3, r3) {
           if (e2(t3), e2(r3), t3 === r3)
             return "";
           if ((t3 = n.resolve(t3)) === (r3 = n.resolve(r3)))
             return "";
-          for (var o = 1; o < t3.length && t3.charCodeAt(o) === 47; ++o)
+          for (var o = 1; o < t3.length && 47 === t3.charCodeAt(o); ++o)
             ;
-          for (var i = t3.length, a = i - o, h = 1; h < r3.length && r3.charCodeAt(h) === 47; ++h)
+          for (var i = t3.length, a = i - o, h = 1; h < r3.length && 47 === r3.charCodeAt(h); ++h)
             ;
           for (var s = r3.length - h, c = a < s ? a : s, f = -1, u = 0; u <= c; ++u) {
             if (u === c) {
               if (s > c) {
-                if (r3.charCodeAt(h + u) === 47)
+                if (47 === r3.charCodeAt(h + u))
                   return r3.slice(h + u + 1);
-                if (u === 0)
+                if (0 === u)
                   return r3.slice(h + u);
               } else
-                a > c && (t3.charCodeAt(o + u) === 47 ? f = u : u === 0 && (f = 0));
+                a > c && (47 === t3.charCodeAt(o + u) ? f = u : 0 === u && (f = 0));
               break;
             }
             var l = t3.charCodeAt(o + u);
             if (l !== r3.charCodeAt(h + u))
               break;
-            l === 47 && (f = u);
+            47 === l && (f = u);
           }
           var p = "";
           for (u = o + f + 1; u <= i; ++u)
-            u !== i && t3.charCodeAt(u) !== 47 || (p.length === 0 ? p += ".." : p += "/..");
-          return p.length > 0 ? p + r3.slice(h + f) : (h += f, r3.charCodeAt(h) === 47 && ++h, r3.slice(h));
+            u !== i && 47 !== t3.charCodeAt(u) || (0 === p.length ? p += ".." : p += "/..");
+          return p.length > 0 ? p + r3.slice(h + f) : (h += f, 47 === r3.charCodeAt(h) && ++h, r3.slice(h));
         }, _makeLong: function(t3) {
           return t3;
         }, dirname: function(t3) {
-          if (e2(t3), t3.length === 0)
+          if (e2(t3), 0 === t3.length)
             return ".";
-          for (var r3 = t3.charCodeAt(0), n2 = r3 === 47, o = -1, i = true, a = t3.length - 1; a >= 1; --a)
-            if ((r3 = t3.charCodeAt(a)) === 47) {
+          for (var r3 = t3.charCodeAt(0), n2 = 47 === r3, o = -1, i = true, a = t3.length - 1; a >= 1; --a)
+            if (47 === (r3 = t3.charCodeAt(a))) {
               if (!i) {
                 o = a;
                 break;
               }
             } else
               i = false;
-          return o === -1 ? n2 ? "/" : "." : n2 && o === 1 ? "//" : t3.slice(0, o);
+          return -1 === o ? n2 ? "/" : "." : n2 && 1 === o ? "//" : t3.slice(0, o);
         }, basename: function(t3, r3) {
-          if (r3 !== void 0 && typeof r3 != "string")
+          if (void 0 !== r3 && "string" != typeof r3)
             throw new TypeError('"ext" argument must be a string');
           e2(t3);
           var n2, o = 0, i = -1, a = true;
-          if (r3 !== void 0 && r3.length > 0 && r3.length <= t3.length) {
+          if (void 0 !== r3 && r3.length > 0 && r3.length <= t3.length) {
             if (r3.length === t3.length && r3 === t3)
               return "";
             var h = r3.length - 1, s = -1;
             for (n2 = t3.length - 1; n2 >= 0; --n2) {
               var c = t3.charCodeAt(n2);
-              if (c === 47) {
+              if (47 === c) {
                 if (!a) {
                   o = n2 + 1;
                   break;
                 }
               } else
-                s === -1 && (a = false, s = n2 + 1), h >= 0 && (c === r3.charCodeAt(h) ? --h == -1 && (i = n2) : (h = -1, i = s));
+                -1 === s && (a = false, s = n2 + 1), h >= 0 && (c === r3.charCodeAt(h) ? -1 == --h && (i = n2) : (h = -1, i = s));
             }
-            return o === i ? i = s : i === -1 && (i = t3.length), t3.slice(o, i);
+            return o === i ? i = s : -1 === i && (i = t3.length), t3.slice(o, i);
           }
           for (n2 = t3.length - 1; n2 >= 0; --n2)
-            if (t3.charCodeAt(n2) === 47) {
+            if (47 === t3.charCodeAt(n2)) {
               if (!a) {
                 o = n2 + 1;
                 break;
               }
             } else
-              i === -1 && (a = false, i = n2 + 1);
-          return i === -1 ? "" : t3.slice(o, i);
+              -1 === i && (a = false, i = n2 + 1);
+          return -1 === i ? "" : t3.slice(o, i);
         }, extname: function(t3) {
           e2(t3);
           for (var r3 = -1, n2 = 0, o = -1, i = true, a = 0, h = t3.length - 1; h >= 0; --h) {
             var s = t3.charCodeAt(h);
-            if (s !== 47)
-              o === -1 && (i = false, o = h + 1), s === 46 ? r3 === -1 ? r3 = h : a !== 1 && (a = 1) : r3 !== -1 && (a = -1);
+            if (47 !== s)
+              -1 === o && (i = false, o = h + 1), 46 === s ? -1 === r3 ? r3 = h : 1 !== a && (a = 1) : -1 !== r3 && (a = -1);
             else if (!i) {
               n2 = h + 1;
               break;
             }
           }
-          return r3 === -1 || o === -1 || a === 0 || a === 1 && r3 === o - 1 && r3 === n2 + 1 ? "" : t3.slice(r3, o);
+          return -1 === r3 || -1 === o || 0 === a || 1 === a && r3 === o - 1 && r3 === n2 + 1 ? "" : t3.slice(r3, o);
         }, format: function(t3) {
-          if (t3 === null || typeof t3 != "object")
+          if (null === t3 || "object" != typeof t3)
             throw new TypeError('The "pathObject" argument must be of type Object. Received type ' + typeof t3);
           return function(t4, e3) {
             var r3 = e3.dir || e3.root, n2 = e3.base || (e3.name || "") + (e3.ext || "");
@@ -20258,25 +21539,25 @@
         }, parse: function(t3) {
           e2(t3);
           var r3 = { root: "", dir: "", base: "", ext: "", name: "" };
-          if (t3.length === 0)
+          if (0 === t3.length)
             return r3;
-          var n2, o = t3.charCodeAt(0), i = o === 47;
+          var n2, o = t3.charCodeAt(0), i = 47 === o;
           i ? (r3.root = "/", n2 = 1) : n2 = 0;
           for (var a = -1, h = 0, s = -1, c = true, f = t3.length - 1, u = 0; f >= n2; --f)
-            if ((o = t3.charCodeAt(f)) !== 47)
-              s === -1 && (c = false, s = f + 1), o === 46 ? a === -1 ? a = f : u !== 1 && (u = 1) : a !== -1 && (u = -1);
+            if (47 !== (o = t3.charCodeAt(f)))
+              -1 === s && (c = false, s = f + 1), 46 === o ? -1 === a ? a = f : 1 !== u && (u = 1) : -1 !== a && (u = -1);
             else if (!c) {
               h = f + 1;
               break;
             }
-          return a === -1 || s === -1 || u === 0 || u === 1 && a === s - 1 && a === h + 1 ? s !== -1 && (r3.base = r3.name = h === 0 && i ? t3.slice(1, s) : t3.slice(h, s)) : (h === 0 && i ? (r3.name = t3.slice(1, a), r3.base = t3.slice(1, s)) : (r3.name = t3.slice(h, a), r3.base = t3.slice(h, s)), r3.ext = t3.slice(a, s)), h > 0 ? r3.dir = t3.slice(0, h - 1) : i && (r3.dir = "/"), r3;
+          return -1 === a || -1 === s || 0 === u || 1 === u && a === s - 1 && a === h + 1 ? -1 !== s && (r3.base = r3.name = 0 === h && i ? t3.slice(1, s) : t3.slice(h, s)) : (0 === h && i ? (r3.name = t3.slice(1, a), r3.base = t3.slice(1, s)) : (r3.name = t3.slice(h, a), r3.base = t3.slice(h, s)), r3.ext = t3.slice(a, s)), h > 0 ? r3.dir = t3.slice(0, h - 1) : i && (r3.dir = "/"), r3;
         }, sep: "/", delimiter: ":", win32: null, posix: null };
         n.posix = n, t2.exports = n;
       }, 447: (t2, e2, r2) => {
         var n;
-        if (r2.r(e2), r2.d(e2, { URI: () => d, Utils: () => P }), typeof process == "object")
-          n = process.platform === "win32";
-        else if (typeof navigator == "object") {
+        if (r2.r(e2), r2.d(e2, { URI: () => d, Utils: () => P }), "object" == typeof process)
+          n = "win32" === process.platform;
+        else if ("object" == typeof navigator) {
           var o = navigator.userAgent;
           n = o.indexOf("Windows") >= 0;
         }
@@ -20288,12 +21569,12 @@
               Object.prototype.hasOwnProperty.call(e4, r3) && (t4[r3] = e4[r3]);
           })(t3, e3);
         }, function(t3, e3) {
-          if (typeof e3 != "function" && e3 !== null)
+          if ("function" != typeof e3 && null !== e3)
             throw new TypeError("Class extends value " + String(e3) + " is not a constructor or null");
           function r3() {
             this.constructor = t3;
           }
-          i(t3, e3), t3.prototype = e3 === null ? Object.create(e3) : (r3.prototype = e3.prototype, new r3());
+          i(t3, e3), t3.prototype = null === e3 ? Object.create(e3) : (r3.prototype = e3.prototype, new r3());
         }), s = /^\w[\w\d+.-]*$/, c = /^\//, f = /^\/\//;
         function u(t3, e3) {
           if (!t3.scheme && e3)
@@ -20310,7 +21591,7 @@
         }
         var l = "", p = "/", g = /^(([^:/?#]+?):)?(\/\/([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?/, d = function() {
           function t3(t4, e3, r3, n2, o2, i2) {
-            i2 === void 0 && (i2 = false), typeof t4 == "object" ? (this.scheme = t4.scheme || l, this.authority = t4.authority || l, this.path = t4.path || l, this.query = t4.query || l, this.fragment = t4.fragment || l) : (this.scheme = function(t5, e4) {
+            void 0 === i2 && (i2 = false), "object" == typeof t4 ? (this.scheme = t4.scheme || l, this.authority = t4.authority || l, this.path = t4.path || l, this.query = t4.query || l, this.fragment = t4.fragment || l) : (this.scheme = function(t5, e4) {
               return t5 || e4 ? t5 : "file";
             }(t4, i2), this.authority = e3 || l, this.path = function(t5, e4) {
               switch (t5) {
@@ -20323,30 +21604,30 @@
             }(this.scheme, r3 || l), this.query = n2 || l, this.fragment = o2 || l, u(this, i2));
           }
           return t3.isUri = function(e3) {
-            return e3 instanceof t3 || !!e3 && typeof e3.authority == "string" && typeof e3.fragment == "string" && typeof e3.path == "string" && typeof e3.query == "string" && typeof e3.scheme == "string" && typeof e3.fsPath == "string" && typeof e3.with == "function" && typeof e3.toString == "function";
+            return e3 instanceof t3 || !!e3 && "string" == typeof e3.authority && "string" == typeof e3.fragment && "string" == typeof e3.path && "string" == typeof e3.query && "string" == typeof e3.scheme && "string" == typeof e3.fsPath && "function" == typeof e3.with && "function" == typeof e3.toString;
           }, Object.defineProperty(t3.prototype, "fsPath", { get: function() {
             return A(this, false);
           }, enumerable: false, configurable: true }), t3.prototype.with = function(t4) {
             if (!t4)
               return this;
             var e3 = t4.scheme, r3 = t4.authority, n2 = t4.path, o2 = t4.query, i2 = t4.fragment;
-            return e3 === void 0 ? e3 = this.scheme : e3 === null && (e3 = l), r3 === void 0 ? r3 = this.authority : r3 === null && (r3 = l), n2 === void 0 ? n2 = this.path : n2 === null && (n2 = l), o2 === void 0 ? o2 = this.query : o2 === null && (o2 = l), i2 === void 0 ? i2 = this.fragment : i2 === null && (i2 = l), e3 === this.scheme && r3 === this.authority && n2 === this.path && o2 === this.query && i2 === this.fragment ? this : new y(e3, r3, n2, o2, i2);
+            return void 0 === e3 ? e3 = this.scheme : null === e3 && (e3 = l), void 0 === r3 ? r3 = this.authority : null === r3 && (r3 = l), void 0 === n2 ? n2 = this.path : null === n2 && (n2 = l), void 0 === o2 ? o2 = this.query : null === o2 && (o2 = l), void 0 === i2 ? i2 = this.fragment : null === i2 && (i2 = l), e3 === this.scheme && r3 === this.authority && n2 === this.path && o2 === this.query && i2 === this.fragment ? this : new y(e3, r3, n2, o2, i2);
           }, t3.parse = function(t4, e3) {
-            e3 === void 0 && (e3 = false);
+            void 0 === e3 && (e3 = false);
             var r3 = g.exec(t4);
             return r3 ? new y(r3[2] || l, O(r3[4] || l), O(r3[5] || l), O(r3[7] || l), O(r3[9] || l), e3) : new y(l, l, l, l, l);
           }, t3.file = function(t4) {
             var e3 = l;
             if (n && (t4 = t4.replace(/\\/g, p)), t4[0] === p && t4[1] === p) {
               var r3 = t4.indexOf(p, 2);
-              r3 === -1 ? (e3 = t4.substring(2), t4 = p) : (e3 = t4.substring(2, r3), t4 = t4.substring(r3) || p);
+              -1 === r3 ? (e3 = t4.substring(2), t4 = p) : (e3 = t4.substring(2, r3), t4 = t4.substring(r3) || p);
             }
             return new y("file", e3, t4, l, l);
           }, t3.from = function(t4) {
             var e3 = new y(t4.scheme, t4.authority, t4.path, t4.query, t4.fragment);
             return u(e3, true), e3;
           }, t3.prototype.toString = function(t4) {
-            return t4 === void 0 && (t4 = false), w(this, t4);
+            return void 0 === t4 && (t4 = false), w(this, t4);
           }, t3.prototype.toJSON = function() {
             return this;
           }, t3.revive = function(e3) {
@@ -20360,13 +21641,13 @@
           }, t3;
         }(), v = n ? 1 : void 0, y = function(t3) {
           function e3() {
-            var e4 = t3 !== null && t3.apply(this, arguments) || this;
+            var e4 = null !== t3 && t3.apply(this, arguments) || this;
             return e4._formatted = null, e4._fsPath = null, e4;
           }
           return h(e3, t3), Object.defineProperty(e3.prototype, "fsPath", { get: function() {
             return this._fsPath || (this._fsPath = A(this, false)), this._fsPath;
           }, enumerable: false, configurable: true }), e3.prototype.toString = function(t4) {
-            return t4 === void 0 && (t4 = false), t4 ? w(this, true) : (this._formatted || (this._formatted = w(this, false)), this._formatted);
+            return void 0 === t4 && (t4 = false), t4 ? w(this, true) : (this._formatted || (this._formatted = w(this, false)), this._formatted);
           }, e3.prototype.toJSON = function() {
             var t4 = { $mid: 1 };
             return this._fsPath && (t4.fsPath = this._fsPath, t4._sep = v), this._formatted && (t4.external = this._formatted), this.path && (t4.path = this.path), this.scheme && (t4.scheme = this.scheme), this.authority && (t4.authority = this.authority), this.query && (t4.query = this.query), this.fragment && (t4.fragment = this.fragment), t4;
@@ -20375,41 +21656,41 @@
         function b(t3, e3) {
           for (var r3 = void 0, n2 = -1, o2 = 0; o2 < t3.length; o2++) {
             var i2 = t3.charCodeAt(o2);
-            if (i2 >= 97 && i2 <= 122 || i2 >= 65 && i2 <= 90 || i2 >= 48 && i2 <= 57 || i2 === 45 || i2 === 46 || i2 === 95 || i2 === 126 || e3 && i2 === 47)
-              n2 !== -1 && (r3 += encodeURIComponent(t3.substring(n2, o2)), n2 = -1), r3 !== void 0 && (r3 += t3.charAt(o2));
+            if (i2 >= 97 && i2 <= 122 || i2 >= 65 && i2 <= 90 || i2 >= 48 && i2 <= 57 || 45 === i2 || 46 === i2 || 95 === i2 || 126 === i2 || e3 && 47 === i2)
+              -1 !== n2 && (r3 += encodeURIComponent(t3.substring(n2, o2)), n2 = -1), void 0 !== r3 && (r3 += t3.charAt(o2));
             else {
-              r3 === void 0 && (r3 = t3.substr(0, o2));
+              void 0 === r3 && (r3 = t3.substr(0, o2));
               var a2 = m[i2];
-              a2 !== void 0 ? (n2 !== -1 && (r3 += encodeURIComponent(t3.substring(n2, o2)), n2 = -1), r3 += a2) : n2 === -1 && (n2 = o2);
+              void 0 !== a2 ? (-1 !== n2 && (r3 += encodeURIComponent(t3.substring(n2, o2)), n2 = -1), r3 += a2) : -1 === n2 && (n2 = o2);
             }
           }
-          return n2 !== -1 && (r3 += encodeURIComponent(t3.substring(n2))), r3 !== void 0 ? r3 : t3;
+          return -1 !== n2 && (r3 += encodeURIComponent(t3.substring(n2))), void 0 !== r3 ? r3 : t3;
         }
         function C(t3) {
           for (var e3 = void 0, r3 = 0; r3 < t3.length; r3++) {
             var n2 = t3.charCodeAt(r3);
-            n2 === 35 || n2 === 63 ? (e3 === void 0 && (e3 = t3.substr(0, r3)), e3 += m[n2]) : e3 !== void 0 && (e3 += t3[r3]);
+            35 === n2 || 63 === n2 ? (void 0 === e3 && (e3 = t3.substr(0, r3)), e3 += m[n2]) : void 0 !== e3 && (e3 += t3[r3]);
           }
-          return e3 !== void 0 ? e3 : t3;
+          return void 0 !== e3 ? e3 : t3;
         }
         function A(t3, e3) {
           var r3;
-          return r3 = t3.authority && t3.path.length > 1 && t3.scheme === "file" ? "//".concat(t3.authority).concat(t3.path) : t3.path.charCodeAt(0) === 47 && (t3.path.charCodeAt(1) >= 65 && t3.path.charCodeAt(1) <= 90 || t3.path.charCodeAt(1) >= 97 && t3.path.charCodeAt(1) <= 122) && t3.path.charCodeAt(2) === 58 ? e3 ? t3.path.substr(1) : t3.path[1].toLowerCase() + t3.path.substr(2) : t3.path, n && (r3 = r3.replace(/\//g, "\\")), r3;
+          return r3 = t3.authority && t3.path.length > 1 && "file" === t3.scheme ? "//".concat(t3.authority).concat(t3.path) : 47 === t3.path.charCodeAt(0) && (t3.path.charCodeAt(1) >= 65 && t3.path.charCodeAt(1) <= 90 || t3.path.charCodeAt(1) >= 97 && t3.path.charCodeAt(1) <= 122) && 58 === t3.path.charCodeAt(2) ? e3 ? t3.path.substr(1) : t3.path[1].toLowerCase() + t3.path.substr(2) : t3.path, n && (r3 = r3.replace(/\//g, "\\")), r3;
         }
         function w(t3, e3) {
           var r3 = e3 ? C : b, n2 = "", o2 = t3.scheme, i2 = t3.authority, a2 = t3.path, h2 = t3.query, s2 = t3.fragment;
-          if (o2 && (n2 += o2, n2 += ":"), (i2 || o2 === "file") && (n2 += p, n2 += p), i2) {
+          if (o2 && (n2 += o2, n2 += ":"), (i2 || "file" === o2) && (n2 += p, n2 += p), i2) {
             var c2 = i2.indexOf("@");
-            if (c2 !== -1) {
+            if (-1 !== c2) {
               var f2 = i2.substr(0, c2);
-              i2 = i2.substr(c2 + 1), (c2 = f2.indexOf(":")) === -1 ? n2 += r3(f2, false) : (n2 += r3(f2.substr(0, c2), false), n2 += ":", n2 += r3(f2.substr(c2 + 1), false)), n2 += "@";
+              i2 = i2.substr(c2 + 1), -1 === (c2 = f2.indexOf(":")) ? n2 += r3(f2, false) : (n2 += r3(f2.substr(0, c2), false), n2 += ":", n2 += r3(f2.substr(c2 + 1), false)), n2 += "@";
             }
-            (c2 = (i2 = i2.toLowerCase()).indexOf(":")) === -1 ? n2 += r3(i2, false) : (n2 += r3(i2.substr(0, c2), false), n2 += i2.substr(c2));
+            -1 === (c2 = (i2 = i2.toLowerCase()).indexOf(":")) ? n2 += r3(i2, false) : (n2 += r3(i2.substr(0, c2), false), n2 += i2.substr(c2));
           }
           if (a2) {
-            if (a2.length >= 3 && a2.charCodeAt(0) === 47 && a2.charCodeAt(2) === 58)
+            if (a2.length >= 3 && 47 === a2.charCodeAt(0) && 58 === a2.charCodeAt(2))
               (u2 = a2.charCodeAt(1)) >= 65 && u2 <= 90 && (a2 = "/".concat(String.fromCharCode(u2 + 32), ":").concat(a2.substr(3)));
-            else if (a2.length >= 2 && a2.charCodeAt(1) === 58) {
+            else if (a2.length >= 2 && 58 === a2.charCodeAt(1)) {
               var u2;
               (u2 = a2.charCodeAt(0)) >= 65 && u2 <= 90 && (a2 = "".concat(String.fromCharCode(u2 + 32), ":").concat(a2.substr(2)));
             }
@@ -20431,7 +21712,7 @@
           }) : t3;
         }
         var P, j = r2(470), U = function(t3, e3, r3) {
-          if (r3 || arguments.length === 2)
+          if (r3 || 2 === arguments.length)
             for (var n2, o2 = 0, i2 = e3.length; o2 < i2; o2++)
               !n2 && o2 in e3 || (n2 || (n2 = Array.prototype.slice.call(e3, 0, o2)), n2[o2] = e3[o2]);
           return t3.concat(n2 || Array.prototype.slice.call(e3));
@@ -20448,7 +21729,7 @@
             return t4.with({ path: I.resolve.apply(I, U([n2], e3, false)) });
           }, t3.dirname = function(t4) {
             var e3 = I.dirname(t4.path);
-            return e3.length === 1 && e3.charCodeAt(0) === 46 ? t4 : t4.with({ path: e3 });
+            return 1 === e3.length && 46 === e3.charCodeAt(0) ? t4 : t4.with({ path: e3 });
           }, t3.basename = function(t4) {
             return I.basename(t4.path);
           }, t3.extname = function(t4) {
@@ -20466,7 +21747,7 @@
         for (var n in e2)
           r.o(e2, n) && !r.o(t2, n) && Object.defineProperty(t2, n, { enumerable: true, get: e2[n] });
       }, r.o = (t2, e2) => Object.prototype.hasOwnProperty.call(t2, e2), r.r = (t2) => {
-        typeof Symbol != "undefined" && Symbol.toStringTag && Object.defineProperty(t2, Symbol.toStringTag, { value: "Module" }), Object.defineProperty(t2, "__esModule", { value: true });
+        "undefined" != typeof Symbol && Symbol.toStringTag && Object.defineProperty(t2, Symbol.toStringTag, { value: "Module" }), Object.defineProperty(t2, "__esModule", { value: true });
       }, r(447);
     })();
     var { URI, Utils } = LIB;
@@ -20587,7 +21868,7 @@
           var offset = idLocations[target];
           if (offset !== void 0) {
             var pos = document.positionAt(offset);
-            link.target = "" + localWithHash + (pos.line + 1) + "," + (pos.character + 1);
+            link.target = "".concat(localWithHash).concat(pos.line + 1, ",").concat(pos.character + 1);
           }
         }
       }
@@ -20660,11 +21941,11 @@
         var id = node.attributes["id"];
         var classes = node.attributes["class"];
         if (id) {
-          name += "#" + id.replace(/[\"\']/g, "");
+          name += "#".concat(id.replace(/[\"\']/g, ""));
         }
         if (classes) {
           name += classes.replace(/[\"\']/g, "").split(/\s+/).map(function(className) {
-            return "." + className;
+            return ".".concat(className);
           }).join("");
         }
       }
@@ -25374,15 +26655,6 @@
           }
         },
         {
-          "name": "aria-describedat",
-          "references": [
-            {
-              "name": "WAI-ARIA Reference",
-              "url": "https://www.w3.org/TR/wai-aria-1.1/#aria-describedat"
-            }
-          ]
-        },
-        {
           "name": "aria-describedby",
           "references": [
             {
@@ -25518,15 +26790,6 @@
             "kind": "markdown",
             "value": "Indicates the entered value does not conform to the format expected by the application. See related [`aria-errormessage`](https://www.w3.org/TR/wai-aria-1.1/#aria-errormessage)."
           }
-        },
-        {
-          "name": "aria-kbdshortcuts",
-          "references": [
-            {
-              "name": "WAI-ARIA Reference",
-              "url": "https://www.w3.org/TR/wai-aria-1.1/#aria-kbdshortcuts"
-            }
-          ]
         },
         {
           "name": "aria-label",

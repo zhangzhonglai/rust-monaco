@@ -9,7 +9,7 @@ use web_sys::HtmlElement;
 use yew::{html, Callback, Classes, Component, Context, Html, NodeRef, Properties};
 
 #[derive(Clone, Debug, PartialEq, Properties)]
-pub struct CodeEditorProps<OPT: std::cmp::PartialEq + Clone + Into<IStandaloneEditorConstructionOptions> = IStandaloneEditorConstructionOptions> {
+pub struct CodeEditorProps<OPT: PartialEq + Clone + Into<IStandaloneEditorConstructionOptions> = IStandaloneEditorConstructionOptions> {
     #[prop_or_default]
     pub link: Option<CodeEditorLink>,
     /// Changing the options will cause the editor to be re-created.

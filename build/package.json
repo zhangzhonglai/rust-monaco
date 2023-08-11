@@ -4,12 +4,12 @@
     "build-debug": "rollup -c --configDebug"
   },
   "dependencies": {
-    "monaco-editor": "^0.32"
+    "monaco-editor": "^0.41"
   },
   "devDependencies": {
-    "@rollup/plugin-node-resolve": "^13.0.0",
-    "rollup": "^2.26.2",
+    "@rollup/plugin-node-resolve": "^13.3.0",
+    "rollup": "^2.79.1",
     "rollup-plugin-styles": "^4.0.0",
-    "rollup-plugin-terser": "^7.0.0"
+    "rollup-plugin-terser": "^7.0.2"
   }
 }
